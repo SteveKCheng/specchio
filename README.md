@@ -31,10 +31,19 @@ This uses `pasta`'s syntax, one port per option; `-T` can be repeated:
 | `-T 8080:192.0.2.1/9090` | same | `192.0.2.1`, port 9090 |
 | `-T 3128:/run/proxy.sock` | same | Unix socket (also `./rel/path`, `../rel/path`; `@name` for abstract sockets) |
 
+`-t`/`--tcp-ports`, `-u`/`--udp-ports` and `-U`/`--udp-ns` are accepted
+with `none` only, as no-ops, so that `pasta` command lines like
+`pasta -t none -u none -U none -T 8080 -- ...` work unchanged. As in `pasta`,
+`-T none` is an error after other `-T` options, but not before them.
+
 Compared to `pasta`:
 
-- Not supported yet: port ranges, lists (`80,443`), exclusions (`~80`), `all`
-  and `auto`. Each is rejected with an error.
+- `auto` isn't supported, and won't be: it forwards whatever the sandbox
+  happens to listen on, and the point of specchio is to grant access
+  explicitly.
+
+- Not supported yet: port ranges, lists (`80,443`), exclusions (`~80`) and
+  `all`. Each is rejected with an error.
 - As with `pasta`, a listening address (`ADDR/PORT`) isn't allowed for `-T`.
   specchio listens on all addresses (dual-stack), bound to `lo` with
   `SO_BINDTODEVICE`.

@@ -31,6 +31,10 @@ Options:
                         /path/to/socket, ./relative/path, @abstract-name
                                       Unix domain socket on the host
                       can be given multiple times
+  -t, --tcp-ports none
+  -u, --udp-ports none
+  -U, --udp-ns none   Accepted for compatibility with pasta(1): no inbound
+                      or UDP forwarding is supported yet
   -d, --debug         Print debugging messages
   -h, --help          Display this help message and exit
       --version       Show version and exit
@@ -137,6 +141,7 @@ pub struct Config {
     pub command: Vec<OsString>,
 }
 
+
 fn parse_port(s: &[u8]) -> Option<u16> {
     if s.is_empty() || !s.iter().all(u8::is_ascii_digit) {
         return None;
@@ -148,6 +153,24 @@ fn parse_ip(s: &[u8]) -> Option<IpAddr> {
     std::str::from_utf8(s).ok()?.parse().ok()
 }
 
+/// Find "auto" in a port specifier: [ADDR/]auto,...
+///
+/// Return: an error message if found
+fn wildcard(spec: &[u8]) -> Option<String> {
+    for chunk in spec.split(|&b| b == b',') {
+        let rest = match chunk.iter().position(|&b| b == b'/') {
+            Some(slash) => &chunk[slash + 1..],
+            None => chunk,
+        };
+        let keyword = rest.split(|&b| b == b':').next().unwrap_or(rest);
+        if keyword == b"auto" {
+            return Some(format!("'{}' isn't supported, by design: forward ports explicitly",
+                                String::from_utf8_lossy(keyword)));
+        }
+    }
+    None
+}
+
 /// Parse a forwarding specification, see USAGE
 ///
 /// Return: None for "none"
@@ -157,6 +180,9 @@ fn parse_forward(spec: &[u8]) -> Result<Option<Forward>, String> {
 
     if spec == b"none" {
         return Ok(None);
+    }
+    if let Some(why) = wildcard(spec) {
+        return Err(bad(&why));
     }
 
     let (port, target) = match spec.iter().position(|&b| b == b':') {
@@ -170,7 +196,7 @@ fn parse_forward(spec: &[u8]) -> Result<Option<Forward>, String> {
             return Err(bad("listening address not allowed for -T"));
         }
         if port.contains(&b'-') || port.contains(&b',') || port.starts_with(b"~")
-            || port == b"all" || port == b"auto"
+            || port == b"all"
         {
             return Err(bad("only single ports are supported"));
         }
@@ -209,10 +235,14 @@ fn parse_forward(spec: &[u8]) -> Result<Option<Forward>, String> {
     Ok(Some(Forward { port, target }))
 }
 
-/// Handle one --tcp-ns option, @none tracks whether "none" was given
-fn tcp_ns(cfg: &mut Config, none: &mut bool, spec: &[u8]) -> Result<(), String> {
+/// Handle one --tcp-ns option
+fn tcp_ns(cfg: &mut Config, spec: &[u8]) -> Result<(), String> {
     match parse_forward(spec)? {
-        None => *none = true,
+        // As in pasta, "none" only conflicts with rules given before it
+        None if !cfg.forwards.is_empty() => {
+            return Err("-T none conflicts with previous options".into());
+        }
+        None => {}
         Some(f) => {
             if let Some(prev) = cfg.forwards.iter().find(|p| p.port == f.port) {
                 return Err(format!("port {} forwarded twice: to {} and to {}", f.port,
@@ -221,10 +251,59 @@ fn tcp_ns(cfg: &mut Config, none: &mut bool, spec: &[u8]) -> Result<(), String> 
             cfg.forwards.push(f);
         }
     }
-    if *none && !cfg.forwards.is_empty() {
-        return Err("-T none conflicts with other -T options".into());
-    }
     Ok(())
+}
+
+/// Options taking a port forwarding specifier, as in pasta
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PortOpt {
+    TcpNs,
+    TcpPorts,
+    UdpPorts,
+    UdpNs,
+}
+
+const PORT_OPTS: [(u8, &str, PortOpt); 4] = [
+    (b'T', "tcp-ns", PortOpt::TcpNs),
+    (b't', "tcp-ports", PortOpt::TcpPorts),
+    (b'u', "udp-ports", PortOpt::UdpPorts),
+    (b'U', "udp-ns", PortOpt::UdpNs),
+];
+
+impl PortOpt {
+    fn long(self) -> &'static str {
+        PORT_OPTS.iter().find(|(_, _, o)| *o == self).map_or("", |(_, l, _)| l)
+    }
+}
+
+/// Match @arg against an option with a value: -X VALUE, -XVALUE, --name VALUE
+/// or --name=VALUE, taking VALUE from @args if needed
+///
+/// Return: None if @arg isn't this option, its value otherwise, or an error if
+///         the value is missing
+fn opt_value(arg: &[u8], short: u8, long: &str, args: &mut impl Iterator<Item = OsString>)
+             -> Option<Result<Vec<u8>, String>> {
+    let value = match arg {
+        [b'-', c] if *c == short => None,
+        [b'-', c, v @ ..] if *c == short => Some(v.to_vec()),
+        [b'-', b'-', rest @ ..] if rest == long.as_bytes() => None,
+        [b'-', b'-', rest @ ..] if rest.starts_with(long.as_bytes())
+            && rest.get(long.len()) == Some(&b'=') => Some(rest[long.len() + 1..].to_vec()),
+        _ => return None,
+    };
+    Some(match value {
+        Some(v) => Ok(v),
+        None => args.next().map(|v| v.into_vec())
+            .ok_or_else(|| format!("option requires an argument: --{long}")),
+    })
+}
+
+/// Match @arg against options taking a port specifier, see opt_value()
+fn port_opt(arg: &[u8], args: &mut impl Iterator<Item = OsString>)
+            -> Option<Result<(PortOpt, Vec<u8>), String>> {
+    PORT_OPTS.iter().find_map(|&(short, long, opt)| {
+        opt_value(arg, short, long, args).map(|v| v.map(|v| (opt, v)))
+    })
 }
 
 /// Parse command line arguments (not including argv[0])
@@ -233,7 +312,6 @@ fn tcp_ns(cfg: &mut Config, none: &mut bool, spec: &[u8]) -> Result<(), String> 
 pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Config>, String> {
     let mut args = args.into_iter();
     let mut cfg = Config { forwards: Vec::new(), debug: false, command: Vec::new() };
-    let mut none = false;
 
     while let Some(arg) = args.next() {
         let a = arg.as_bytes();
@@ -248,14 +326,16 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Config>,
                 return Ok(None);
             }
             b"-d" | b"--debug" => cfg.debug = true,
-            b"-T" | b"--tcp-ns" => {
-                let v = args.next().ok_or("option requires an argument: --tcp-ns")?;
-                tcp_ns(&mut cfg, &mut none, v.as_bytes())?;
-            }
-            _ if a.starts_with(b"--tcp-ns=") => {
-                tcp_ns(&mut cfg, &mut none, &a[b"--tcp-ns=".len()..])?;
-            }
-            _ if a.starts_with(b"-T") => tcp_ns(&mut cfg, &mut none, &a[2..])?,
+            _ if let Some(r) = port_opt(a, &mut args) => match r? {
+                (PortOpt::TcpNs, spec) => tcp_ns(&mut cfg, &spec)?,
+                // No-ops for now, only "none" is accepted
+                (_, spec) if spec == b"none" => {}
+                (opt, spec) => {
+                    let why = wildcard(&spec).unwrap_or_else(|| "not supported yet".into());
+                    return Err(format!("invalid --{} '{}': {why}", opt.long(),
+                                       String::from_utf8_lossy(&spec)));
+                }
+            },
             _ if a.starts_with(b"-") && a.len() > 1 => {
                 return Err(format!("unrecognised option: {}", arg.to_string_lossy()));
             }
@@ -335,7 +415,37 @@ mod tests {
         assert_eq!(cfg.forwards.len(), 3);
         assert_eq!(cfg.command, ["true"]);
         assert!(args(&["-T", "none", "true"]).unwrap().unwrap().forwards.is_empty());
-        assert!(args(&["-T", "none", "-T", "80"]).is_err());
+        assert_eq!(args(&["-T", "none", "-T", "80"]).unwrap().unwrap().forwards.len(), 1);
+        assert!(args(&["-T", "80", "-T", "none"]).is_err());
         assert!(args(&["-T", "80", "-T", "80:81"]).is_err());
+        assert!(args(&["-T"]).is_err());
+    }
+
+    #[test]
+    fn none_options() {
+        let args = |a: &[&str]| parse(a.iter().map(OsString::from));
+        let cfg = args(&["-t", "none", "-unone", "--udp-ns", "none", "--tcp-ports=none",
+                         "--udp-ports=none", "-Unone", "-T", "none", "--tcp-ns=none", "true"])
+            .unwrap().unwrap();
+        assert!(cfg.forwards.is_empty());
+        assert_eq!(cfg.command, ["true"]);
+
+        let cfg = args(&["-t", "none", "-T", "8080", "-U", "none", "true"]).unwrap().unwrap();
+        assert_eq!(cfg.forwards.len(), 1);
+
+        for bad in [&["-t", "80"][..], &["-u", "53"], &["--udp-ns=53"], &["-U"], &["--tcp-ports"],
+                    &["--tcp-portsnone"]] {
+            assert!(args(bad).is_err(), "{bad:?} should be invalid");
+        }
+    }
+
+    #[test]
+    fn auto() {
+        for spec in ["auto", "::1/auto", "8000-8010,auto"] {
+            for opt in ["-T", "-t", "-u", "-U"] {
+                let e = parse([opt, spec].iter().map(OsString::from)).unwrap_err();
+                assert!(e.contains("by design"), "{opt} {spec}: {e}");
+            }
+        }
     }
 }
