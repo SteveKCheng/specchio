@@ -4,8 +4,8 @@
 //!
 //! A narrow-scoped mirror of pasta (from passt): run a command in new user and
 //! network namespaces where only the loopback interface exists, and forward
-//! selected TCP ports in there to Unix domain sockets on the host, moving data
-//! with splice() only.
+//! selected TCP ports in there to TCP ports or Unix domain sockets on the
+//! host, moving data with splice() only.
 
 mod config;
 mod epoll;
@@ -15,15 +15,16 @@ mod sandbox;
 mod splice;
 mod sys;
 
+use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use config::{Config, UnixTarget};
+use config::{Config, Target};
 use epoll::{Epoll, Ref};
 use log::{debug, info};
 use sandbox::{Listener, Sandbox};
-use splice::{Conn, PipePool};
+use splice::{Conn, Peer, PipePool};
 
 /// Descriptors reserved for things other than connections
 const RESERVED_FDS: usize = 64;
@@ -43,8 +44,9 @@ const CONNECT_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Clone, Copy)]
 struct Retry {
     id: usize,
-    /// Index of the forward, hence the target
+    /// Index of the forward, for logging
     fwd: usize,
+    peer: Peer,
     next: Instant,
     delay: Duration,
     deadline: Instant,
@@ -55,7 +57,7 @@ struct Forwarder {
     ep: Epoll,
     pool: PipePool,
     listeners: Vec<Listener>,
-    targets: Vec<UnixTarget>,
+    targets: Vec<Target>,
     /// Connection table, indexed by connection id
     conns: Vec<Option<Conn>>,
     /// Free entries in @conns
@@ -131,20 +133,29 @@ impl Forwarder {
             self.nconns += 1;
 
             let fwd = self.listeners[li].fwd;
-            debug!("conn {id}: accepted on {}, connecting to {}", self.listeners[li].addr,
-                   self.targets[fwd]);
+            let mut conn = Conn::new(id, s);
 
-            self.conns[id] = Some(Conn::new(id, s));
-            self.connect(id, fwd, None);
+            match peer(&self.targets[fwd], &conn) {
+                Ok(peer) => {
+                    self.conns[id] = Some(conn);
+                    self.connect(id, fwd, peer, None);
+                }
+                Err(e) => {
+                    info!("conn {id}: cannot connect to {}: {e}", self.targets[fwd]);
+                    conn.rst(&self.ep);
+                    self.conns[id] = Some(conn);
+                    self.defer.push(id);
+                }
+            }
         }
     }
 
-    /// Connect connection @id to the target of forward @fwd, or queue a retry
-    fn connect(&mut self, id: usize, fwd: usize, mut retry: Option<Retry>) {
+    /// Connect connection @id to @peer for forward @fwd, or queue a retry
+    fn connect(&mut self, id: usize, fwd: usize, peer: Peer, mut retry: Option<Retry>) {
         let target = &self.targets[fwd];
         let Some(conn) = self.conns[id].as_mut() else { return };
 
-        match conn.connect(&self.ep, &mut self.pool, target) {
+        match conn.connect(&self.ep, &mut self.pool, &peer) {
             Ok(true) => {}
             Ok(false) => {
                 let now = Instant::now();
@@ -153,6 +164,7 @@ impl Forwarder {
                     Retry {
                         id,
                         fwd,
+                        peer,
                         next: now,
                         delay: CONNECT_RETRY_MIN,
                         deadline: now + CONNECT_RETRY_TIMEOUT,
@@ -185,7 +197,7 @@ impl Forwarder {
             .partition::<Vec<_>, _>(|r| r.next <= now);
         self.retries = wait;
         for r in due {
-            self.connect(r.id, r.fwd, Some(r));
+            self.connect(r.id, r.fwd, r.peer, Some(r));
         }
     }
 
@@ -220,7 +232,37 @@ impl Forwarder {
     }
 }
 
+/// Find the address to connect to on the host for a new connection
+fn peer(target: &Target, conn: &Conn) -> std::io::Result<Peer> {
+    let peer = match target {
+        Target::Unix(u) => {
+            let (sun, len) = u.sockaddr().map_err(std::io::Error::other)?;
+            Peer::Unix(sun, len)
+        }
+        Target::Tcp { addr: Some(addr), port } => Peer::Tcp(SocketAddr::new(*addr, *port)),
+        Target::Tcp { addr: None, port } => {
+            // Same (loopback) address as the one connected to in the namespace
+            let local = sys::local_addr(conn.fd(0))?;
+            Peer::Tcp(SocketAddr::new(local.ip(), *port))
+        }
+    };
+
+    match &peer {
+        Peer::Tcp(a) => debug!("conn {}: accepted, connecting to {a}", conn.id()),
+        Peer::Unix(..) => debug!("conn {}: accepted, connecting to {target}", conn.id()),
+    }
+    Ok(peer)
+}
+
 fn run(cfg: Config) -> Result<u8, String> {
+    // Only addresses of host interfaces are allowed as targets, for now
+    for f in &cfg.forwards {
+        if let Target::Tcp { addr: Some(addr), .. } = f.target {
+            sys::check_local_addr(addr)
+                .map_err(|e| format!("{addr} isn't an address of a host interface: {e}"))?;
+        }
+    }
+
     let (nofile_orig, nofile) = sys::raise_nofile()
         .map_err(|e| format!("cannot get file descriptor limit: {e}"))?;
 
@@ -241,7 +283,7 @@ fn run(cfg: Config) -> Result<u8, String> {
     for (i, l) in listeners.iter().enumerate() {
         ep.add(l.fd.as_raw_fd(), libc::EPOLLIN as u32, Ref::Listener(i))
             .map_err(|e| format!("epoll_ctl(): {e}"))?;
-        debug!("listening on {} in namespace for {}", l.addr, cfg.forwards[l.fwd].target);
+        debug!("listening on {} (lo) in namespace for {}", l.addr, cfg.forwards[l.fwd].target);
     }
 
     let max_conns = (nofile.saturating_sub(RESERVED_FDS + listeners.len()) / FDS_PER_CONN).max(1);
@@ -292,7 +334,7 @@ fn main() -> ExitCode {
         Ok(None) => return ExitCode::SUCCESS,
         Err(e) => {
             info!("{e}");
-            eprint!("{}", config::USAGE);
+            eprintln!("Try 'specchio --help' for more information.");
             return ExitCode::FAILURE;
         }
     };

@@ -5,7 +5,7 @@
 use std::ffi::OsString;
 use std::fmt;
 use std::mem::{offset_of, size_of, zeroed};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 
@@ -14,23 +14,31 @@ Usage: specchio [OPTION]... [--] [COMMAND [ARG]...]
 
 Run COMMAND (default: $SHELL) in new user and network namespaces with only a
 loopback interface, splicing TCP connections to forwarded ports in the
-namespace to Unix domain sockets on the host.
+namespace to TCP ports or Unix domain sockets on the host.
 
 Options:
-  -T, --tcp-ns SPEC   Forward TCP port from namespace to host Unix socket
-                      SPEC is [ADDR/]PORT:TARGET
-                        ADDR    address to listen on in the namespace;
-                                default: 127.0.0.1 and ::1 (if available)
-                        TARGET  /path/to/socket, or @name for an abstract
-                                socket (relative paths are made absolute)
+  -T, --tcp-ns SPEC   Forward a TCP port from the namespace to the host, as
+                      with pasta(1), connections to any loopback address in
+                      the namespace.  SPEC can be:
+                        none          don't forward anything
+                        PORT[:TARGET]
+                      where TARGET is one of:
+                        TOPORT        same loopback address on the host as
+                                      the one connected to in the namespace,
+                                      port TOPORT (default: PORT)
+                        TOADDR[/TOPORT]
+                                      address of a host interface
+                        /path/to/socket, ./relative/path, @abstract-name
+                                      Unix domain socket on the host
                       can be given multiple times
   -d, --debug         Print debugging messages
   -h, --help          Display this help message and exit
       --version       Show version and exit
 
-Example:
+Examples:
   specchio -T 3128:/run/user/1000/proxy.sock -- \\
       env https_proxy=http://127.0.0.1:3128 curl https://example.com/
+  specchio -T 8080 -T 5432:192.0.2.1/5433 -- my-agent
 ";
 
 /// Host side Unix domain socket to connect to
@@ -96,19 +104,30 @@ impl fmt::Display for UnixTarget {
     }
 }
 
-/// Address to listen on in the namespace
-#[derive(Clone, Copy, Debug)]
-pub struct Bind {
-    pub addr: SocketAddr,
-    /// Don't fail if we can't bind (used for the default ::1)
-    pub best_effort: bool,
+/// Where to connect to on the host
+#[derive(Clone, Debug)]
+pub enum Target {
+    /// TCP port, at @addr, or at the address connected to in the namespace
+    Tcp { addr: Option<IpAddr>, port: u16 },
+    Unix(UnixTarget),
+}
+
+impl fmt::Display for Target {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Target::Tcp { addr: Some(a), port } => write!(f, "{}", SocketAddr::new(*a, *port)),
+            Target::Tcp { addr: None, port } => write!(f, "port {port} on loopback"),
+            Target::Unix(u) => write!(f, "{u}"),
+        }
+    }
 }
 
 /// One port forwarding specification
 #[derive(Clone, Debug)]
 pub struct Forward {
-    pub binds: Vec<Bind>,
-    pub target: UnixTarget,
+    /// Port to listen on in the namespace, on any loopback address
+    pub port: u16,
+    pub target: Target,
 }
 
 #[derive(Debug)]
@@ -118,41 +137,94 @@ pub struct Config {
     pub command: Vec<OsString>,
 }
 
-/// Parse a forwarding specification: [ADDR/]PORT:TARGET
-fn parse_forward(spec: &[u8]) -> Result<Forward, String> {
-    let bad = |why: &str| format!("invalid forwarding spec '{}': {why}",
+fn parse_port(s: &[u8]) -> Option<u16> {
+    if s.is_empty() || !s.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(s).ok()?.parse().ok().filter(|&p| p != 0)
+}
+
+fn parse_ip(s: &[u8]) -> Option<IpAddr> {
+    std::str::from_utf8(s).ok()?.parse().ok()
+}
+
+/// Parse a forwarding specification, see USAGE
+///
+/// Return: None for "none"
+fn parse_forward(spec: &[u8]) -> Result<Option<Forward>, String> {
+    let bad = |why: &str| format!("invalid port specifier '{}': {why}",
                                   String::from_utf8_lossy(spec));
 
-    // The target may contain both '/' and ':', and an IPv6 address contains
-    // ':', so: if everything before the first ':' is a port number, there's
-    // no address.  Otherwise the address ends at the first '/'.
-    let colon = spec.iter().position(|&b| b == b':').ok_or_else(|| bad("missing ':'"))?;
-    let (addr, rest) = if colon > 0 && spec[..colon].iter().all(u8::is_ascii_digit) {
-        (None, spec)
-    } else {
-        let slash = spec.iter().position(|&b| b == b'/').ok_or_else(|| bad("missing '/'"))?;
-        let a = std::str::from_utf8(&spec[..slash]).map_err(|_| bad("bad address"))?;
-        let a = a.strip_prefix('[').and_then(|a| a.strip_suffix(']')).unwrap_or(a);
-        (Some(a.parse::<IpAddr>().map_err(|e| bad(&e.to_string()))?), &spec[slash + 1..])
+    if spec == b"none" {
+        return Ok(None);
+    }
+
+    let (port, target) = match spec.iter().position(|&b| b == b':') {
+        Some(colon) => (&spec[..colon], Some(&spec[colon + 1..])),
+        None => (spec, None),
     };
 
-    let colon = rest.iter().position(|&b| b == b':').ok_or_else(|| bad("missing ':'"))?;
-    let port: u16 = std::str::from_utf8(&rest[..colon])
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .filter(|&p| p != 0)
-        .ok_or_else(|| bad("bad port"))?;
-    let target = UnixTarget::parse(&rest[colon + 1..]).map_err(|e| bad(&e))?;
-
-    let binds = match addr {
-        Some(a) => vec![Bind { addr: SocketAddr::new(a, port), best_effort: false }],
-        None => vec![
-            Bind { addr: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port), best_effort: false },
-            Bind { addr: SocketAddr::new(Ipv6Addr::LOCALHOST.into(), port), best_effort: true },
-        ],
+    let Some(port) = parse_port(port) else {
+        // pasta's error for [ADDRESS[%IFNAME]/]PORT with -T, otherwise a guess
+        if port.contains(&b'/') || port.contains(&b'%') || parse_ip(port).is_some() {
+            return Err(bad("listening address not allowed for -T"));
+        }
+        if port.contains(&b'-') || port.contains(&b',') || port.starts_with(b"~")
+            || port == b"all" || port == b"auto"
+        {
+            return Err(bad("only single ports are supported"));
+        }
+        return Err(bad("bad port"));
     };
 
-    Ok(Forward { binds, target })
+    let target = match target {
+        None => Target::Tcp { addr: None, port },
+        Some([]) => return Err(bad("empty target")),
+        Some(t @ ([b'/' | b'@', ..] | [b'.', b'/', ..] | [b'.', b'.', b'/', ..])) => {
+            Target::Unix(UnixTarget::parse(t).map_err(|e| bad(&e))?)
+        }
+        Some(t) => {
+            let (addr, toport) = match t.iter().position(|&b| b == b'/') {
+                Some(slash) => {
+                    let toport = parse_port(&t[slash + 1..]).ok_or_else(|| bad("bad target port"))?;
+                    (Some(&t[..slash]), toport)
+                }
+                None if t.iter().all(u8::is_ascii_digit) => {
+                    (None, parse_port(t).ok_or_else(|| bad("bad target port"))?)
+                }
+                None => (Some(t), port),
+            };
+            let addr = match addr {
+                Some(a) => Some(parse_ip(a).ok_or_else(|| {
+                    bad("target must be a port, an IP address, or a Unix socket path \
+                         starting with '/', './', '../' or '@'")
+                })?),
+                None => None,
+            };
+            // Unspecified target address means automatic, as with pasta
+            Target::Tcp { addr: addr.filter(|a| !a.is_unspecified()), port: toport }
+        }
+    };
+
+    Ok(Some(Forward { port, target }))
+}
+
+/// Handle one --tcp-ns option, @none tracks whether "none" was given
+fn tcp_ns(cfg: &mut Config, none: &mut bool, spec: &[u8]) -> Result<(), String> {
+    match parse_forward(spec)? {
+        None => *none = true,
+        Some(f) => {
+            if let Some(prev) = cfg.forwards.iter().find(|p| p.port == f.port) {
+                return Err(format!("port {} forwarded twice: to {} and to {}", f.port,
+                                   prev.target, f.target));
+            }
+            cfg.forwards.push(f);
+        }
+    }
+    if *none && !cfg.forwards.is_empty() {
+        return Err("-T none conflicts with other -T options".into());
+    }
+    Ok(())
 }
 
 /// Parse command line arguments (not including argv[0])
@@ -161,6 +233,7 @@ fn parse_forward(spec: &[u8]) -> Result<Forward, String> {
 pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Config>, String> {
     let mut args = args.into_iter();
     let mut cfg = Config { forwards: Vec::new(), debug: false, command: Vec::new() };
+    let mut none = false;
 
     while let Some(arg) = args.next() {
         let a = arg.as_bytes();
@@ -177,12 +250,12 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Config>,
             b"-d" | b"--debug" => cfg.debug = true,
             b"-T" | b"--tcp-ns" => {
                 let v = args.next().ok_or("option requires an argument: --tcp-ns")?;
-                cfg.forwards.push(parse_forward(v.as_bytes())?);
+                tcp_ns(&mut cfg, &mut none, v.as_bytes())?;
             }
             _ if a.starts_with(b"--tcp-ns=") => {
-                cfg.forwards.push(parse_forward(&a[b"--tcp-ns=".len()..])?);
+                tcp_ns(&mut cfg, &mut none, &a[b"--tcp-ns=".len()..])?;
             }
-            _ if a.starts_with(b"-T") => cfg.forwards.push(parse_forward(&a[2..])?),
+            _ if a.starts_with(b"-T") => tcp_ns(&mut cfg, &mut none, &a[2..])?,
             _ if a.starts_with(b"-") && a.len() > 1 => {
                 return Err(format!("unrecognised option: {}", arg.to_string_lossy()));
             }
@@ -198,8 +271,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Config>,
         cfg.command.push(std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into()));
     }
 
-    let nbinds: usize = cfg.forwards.iter().map(|f| f.binds.len()).sum();
-    if nbinds > crate::fdpass::MAX_FDS {
+    if cfg.forwards.len() > crate::fdpass::MAX_FDS {
         return Err(format!("too many listening sockets (maximum {})", crate::fdpass::MAX_FDS));
     }
 
@@ -210,35 +282,60 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Config>,
 mod tests {
     use super::*;
 
-    #[test]
-    fn port_only() {
-        let f = parse_forward(b"3128:/run/proxy.sock").unwrap();
-        assert_eq!(f.binds.len(), 2);
-        assert_eq!(f.binds[0].addr, "127.0.0.1:3128".parse().unwrap());
-        assert!(matches!(f.target, UnixTarget::Path(ref p) if p == "/run/proxy.sock"));
+    fn fwd(spec: &str) -> Forward {
+        parse_forward(spec.as_bytes()).unwrap().unwrap()
+    }
+
+    fn tcp(spec: &str) -> (u16, Option<IpAddr>, u16) {
+        match fwd(spec) {
+            Forward { port, target: Target::Tcp { addr, port: to } } => (port, addr, to),
+            f => panic!("not a TCP target: {f:?}"),
+        }
     }
 
     #[test]
-    fn with_address() {
-        let f = parse_forward(b"::1/8080:@proxy:x").unwrap();
-        assert_eq!(f.binds.len(), 1);
-        assert_eq!(f.binds[0].addr, "[::1]:8080".parse().unwrap());
-        assert!(matches!(f.target, UnixTarget::Abstract(ref n) if n == b"proxy:x"));
+    fn pasta_syntax() {
+        assert!(parse_forward(b"none").unwrap().is_none());
+        assert_eq!(tcp("8080"), (8080, None, 8080));
+        assert_eq!(tcp("8080:9090"), (8080, None, 9090));
+        assert_eq!(tcp("8080:192.0.2.1"), (8080, Some("192.0.2.1".parse().unwrap()), 8080));
+        assert_eq!(tcp("8080:192.0.2.1/80"), (8080, Some("192.0.2.1".parse().unwrap()), 80));
+        assert_eq!(tcp("8080:::1"), (8080, Some("::1".parse().unwrap()), 8080));
+        assert_eq!(tcp("8080:2001:db8::1/80"), (8080, Some("2001:db8::1".parse().unwrap()), 80));
+        assert_eq!(tcp("8080:0.0.0.0/80"), (8080, None, 80));
+    }
 
-        let f = parse_forward(b"[::1]/8080:/a").unwrap();
-        assert_eq!(f.binds[0].addr, "[::1]:8080".parse().unwrap());
-        let f = parse_forward(b"127.0.0.2/1:/a/b:c").unwrap();
-        assert_eq!(f.binds[0].addr, "127.0.0.2:1".parse().unwrap());
+    #[test]
+    fn unix_targets() {
+        let f = fwd("3128:/run/proxy.sock");
+        assert_eq!(f.port, 3128);
+        assert!(matches!(f.target, Target::Unix(UnixTarget::Path(ref p)) if p == "/run/proxy.sock"));
+        let f = fwd("3128:@proxy:x/y");
+        assert!(matches!(f.target, Target::Unix(UnixTarget::Abstract(ref n)) if n == b"proxy:x/y"));
+        let f = fwd("3128:./proxy.sock");
+        assert!(matches!(f.target, Target::Unix(UnixTarget::Path(ref p)) if p.is_absolute()));
     }
 
     #[test]
     fn invalid() {
-        assert!(parse_forward(b"3128").is_err());
-        assert!(parse_forward(b"0:/a").is_err());
-        assert!(parse_forward(b"70000:/a").is_err());
-        assert!(parse_forward(b"3128:").is_err());
-        assert!(parse_forward(b"foo/3128:/a").is_err());
+        for spec in ["", "0", "70000", "8080:", "8080:0", "8080:x", "8080:proxy.sock",
+                     "8080:192.0.2.1/", "8080:192.0.2.1/x", "8080:[::1]/80",
+                     "127.0.0.1/8080", "::1/8080:/a", "%lo/8080", "80-90", "80,81",
+                     "~80", "all", "auto"] {
+            assert!(parse_forward(spec.as_bytes()).is_err(), "'{spec}' should be invalid");
+        }
         let long = format!("1:/{}", "x".repeat(200));
         assert!(parse_forward(long.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn options() {
+        let args = |a: &[&str]| parse(a.iter().map(OsString::from));
+        let cfg = args(&["-T", "80", "-T443:8443", "--tcp-ns=22", "--", "true"]).unwrap().unwrap();
+        assert_eq!(cfg.forwards.len(), 3);
+        assert_eq!(cfg.command, ["true"]);
+        assert!(args(&["-T", "none", "true"]).unwrap().unwrap().forwards.is_empty());
+        assert!(args(&["-T", "none", "-T", "80"]).is_err());
+        assert!(args(&["-T", "80", "-T", "80:81"]).is_err());
     }
 }

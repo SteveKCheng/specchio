@@ -4,7 +4,7 @@
 
 use std::io;
 use std::mem::{size_of, zeroed};
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 
 /// Turn a C-style `-1` return value into an `io::Error` from `errno`
@@ -115,6 +115,55 @@ pub fn sockaddr_ip(addr: &SocketAddr) -> (libc::sockaddr_storage, libc::socklen_
         }
     };
     (ss, len as libc::socklen_t)
+}
+
+/// Convert a socket address filled in by the kernel, if it's IPv4 or IPv6
+///
+/// IPv4-mapped IPv6 addresses (from dual-stack sockets) are returned as IPv4
+pub fn sockaddr_to_ip(ss: &libc::sockaddr_storage) -> Option<SocketAddr> {
+    match ss.ss_family as i32 {
+        libc::AF_INET => {
+            // SAFETY: The kernel stored a sockaddr_in, as ss_family says
+            let sin = unsafe { &*(ss as *const _ as *const libc::sockaddr_in) };
+            Some(SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)),
+                u16::from_be(sin.sin_port),
+            )))
+        }
+        libc::AF_INET6 => {
+            // SAFETY: The kernel stored a sockaddr_in6, as ss_family says
+            let sin6 = unsafe { &*(ss as *const _ as *const libc::sockaddr_in6) };
+            let ip = Ipv6Addr::from(sin6.sin6_addr.s6_addr);
+            let port = u16::from_be(sin6.sin6_port);
+            Some(match ip.to_ipv4_mapped() {
+                Some(ip4) => SocketAddr::V4(SocketAddrV4::new(ip4, port)),
+                None => SocketAddr::V6(SocketAddrV6::new(ip, port, sin6.sin6_flowinfo,
+                                                         sin6.sin6_scope_id)),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Get the local address of an IPv4 or IPv6 socket
+pub fn local_addr(fd: RawFd) -> io::Result<SocketAddr> {
+    // SAFETY: All-zero is a valid sockaddr_storage
+    let mut ss: libc::sockaddr_storage = unsafe { zeroed() };
+    let mut len = size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    // SAFETY: Passing a valid buffer and its length
+    cvt(unsafe { libc::getsockname(fd, (&mut ss as *mut libc::sockaddr_storage).cast(), &mut len) })?;
+    sockaddr_to_ip(&ss).ok_or_else(|| io::Error::other("not an IP socket"))
+}
+
+/// Check that @addr is assigned to an interface, by binding a socket to it
+pub fn check_local_addr(addr: IpAddr) -> io::Result<()> {
+    let sa = SocketAddr::new(addr, 0);
+    let af = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
+    let s = socket(af, libc::SOCK_STREAM)?;
+    let (ss, len) = sockaddr_ip(&sa);
+    // SAFETY: ss is a valid socket address of length len
+    cvt(unsafe { libc::bind(s.as_raw_fd(), (&ss as *const libc::sockaddr_storage).cast(), len) })
+        .map(drop)
 }
 
 /// Create a non-blocking pipe, return (read end, write end)

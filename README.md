@@ -3,8 +3,10 @@
 *Specchio* (Italian for "mirror") is a narrowly scoped relative of `pasta`
 from [passt](https://passt.top/). It runs a command in new user and network
 namespaces where only `lo` exists, and forwards chosen TCP ports inside them
-to Unix domain sockets on the host. Data moves only by `splice()`, and there
-is no TAP interface, no packet parsing and no `fork()` per connection.
+to TCP ports or Unix domain sockets on the host. Data moves only by
+`splice()`, and there is no TAP interface, no packet parsing and no `fork()`
+per connection. The goal is to cover all of `pasta`'s splicing (TCP and UDP,
+in both directions); so far, TCP from the sandbox to the host works.
 
 The intended use is sandboxing: give a sandboxed agent access to, say, an
 HTTP(S) proxy as an object capability. The agent can reach the forwarded port
@@ -16,10 +18,36 @@ specchio -T 3128:/run/user/1000/proxy.sock -- \
     env https_proxy=http://127.0.0.1:3128 agent ...
 ```
 
-`-T [ADDR/]PORT:TARGET` can be repeated. `TARGET` is a path, or `@name` for an
-abstract socket. Without `ADDR`, specchio listens on `127.0.0.1` and, if
-available, `::1`. With no command, specchio runs `$SHELL`. specchio exits with
-the command's exit status (128 + signal number if it was killed).
+### `-T`, `--tcp-ns`
+
+This uses `pasta`'s syntax, one port per option; `-T` can be repeated:
+
+| Spec | In the namespace | Connects to on the host |
+|---|---|---|
+| `-T none` | nothing | |
+| `-T 8080` | any loopback address, port 8080 | the same loopback address (`127.0.0.5` → `127.0.0.5`, `::1` → `::1`), port 8080 |
+| `-T 8080:9090` | same | the same loopback address, port 9090 |
+| `-T 8080:192.0.2.1` | same | `192.0.2.1`, port 8080 |
+| `-T 8080:192.0.2.1/9090` | same | `192.0.2.1`, port 9090 |
+| `-T 3128:/run/proxy.sock` | same | Unix socket (also `./rel/path`, `../rel/path`; `@name` for abstract sockets) |
+
+Compared to `pasta`:
+
+- Not supported yet: port ranges, lists (`80,443`), exclusions (`~80`), `all`
+  and `auto`. Each is rejected with an error.
+- As with `pasta`, a listening address (`ADDR/PORT`) isn't allowed for `-T`.
+  specchio listens on all addresses (dual-stack), bound to `lo` with
+  `SO_BINDTODEVICE`.
+- The target address is honoured. `pasta` parses it for `-T`, but
+  `fwd_nat_from_splice()` ignores it and always uses the same loopback
+  address. It must be the address of a host interface, which is
+  checked at startup; other hosts can't be reached. Unspecified addresses
+  (`0.0.0.0`, `::`) mean "automatic", as in `pasta`.
+- Unix domain socket targets are a specchio extension. A target starting with
+  `/`, `./`, `../` or `@` can't be a port or an address in `pasta`'s syntax.
+
+With no command, specchio runs `$SHELL`. It exits with the command's exit
+status (128 + signal number if the command was killed).
 
 ## How it works
 
@@ -33,8 +61,9 @@ the command's exit status (128 + signal number if it was killed).
    closed before `exec`, and the parent lives in the outer user namespace, so
    the command can't `ptrace` it or use `pidfd_getfd()` on it.
 2. **Parent (`main.rs`, `splice.rs`)**: a single-threaded epoll loop accepts
-   connections, connects to the target, and splices both directions through a
-   pipe pair. The connection state machine is ported from `tcp_splice.c`
+   connections, connects to the target (for a TCP target without an address,
+   the namespace side's local address from `getsockname()`), and splices both
+   directions through a pipe pair. The connection state machine is ported from `tcp_splice.c`
    (`SPLICE_CONNECT`, `OUT_WAIT_n`, `FIN_RCVD_n`, `FIN_SENT_n`, the pipe pool,
    and `SPLICE_F_MORE`/`TCP_NODELAY` corking). The parent waits for the command
    with a pidfd, and the child gets `PR_SET_PDEATHSIG`, so neither outlives the
@@ -54,13 +83,15 @@ the command's exit status (128 + signal number if it was killed).
 - **`connect()` retries.** A non-blocking `connect()` to a Unix socket with a
   full listen backlog fails with `EAGAIN`, and nothing notifies us when there's
   room again. specchio retries with exponential backoff (1 ms to 100 ms) and
-  gives up after 5 s.
+  gives up after 5 s. For TCP, `EAGAIN` means no free local ports, and is
+  retried in the same way.
 - `SO_RCVLOWAT` handling is left out, since `tcp_splice.c` no longer enables
   it anyway.
 
 ## Not yet done
 
-- **Inbound forwarding** (host port to sandbox). This needs sockets created in
+- **UDP** (`-U`), and port ranges and lists for `-T`.
+- **Inbound forwarding** (`-t`/`-u`, host port to sandbox). This needs sockets created in
   the sandbox namespace on demand, and a pool sent at startup can't be refilled
   once the child has `exec`'d. Options: keep a small helper process in the
   namespace that makes sockets on request over the same `socketpair`, or have
@@ -80,6 +111,9 @@ the command's exit status (128 + signal number if it was killed).
 cargo test               # unit tests (argument parsing)
 cargo build --release && tests/run.sh   # end-to-end, needs python3 and socat
 ```
+
+Throughput with `dd | socat` over host loopback, 8 GB: about 4.4 GB/s for a
+direct connection, `pasta --splice-only -T` and specchio alike.
 
 ## Licence
 

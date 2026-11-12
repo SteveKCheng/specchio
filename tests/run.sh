@@ -25,7 +25,17 @@ check() {
 socat UNIX-LISTEN:"${TMP}/echo.sock",fork EXEC:cat 2>/dev/null & PIDS="${PIDS} $!"
 socat ABSTRACT-LISTEN:specchio-test-$$,fork EXEC:cat 2>/dev/null & PIDS="${PIDS} $!"
 python3 "${TESTS}/bulk_server.py" "${TMP}/bulk.sock" 50000000 & PIDS="${PIDS} $!"
+python3 "${TESTS}/bulk_server.py" tcp:127.0.0.1:18500 50000000 & PIDS="${PIDS} $!"
+python3 "${TESTS}/tcp_server.py" 0.0.0.0:18000 [::]:18000 0.0.0.0:19000 [::]:19000 \
+	>/dev/null & PIDS="${PIDS} $!"
 sleep 0.5
+
+# Connect to ADDR PORT in the sandbox, check echo and host address reached
+tcp() {
+	expect="$1"; addr="$2"; port="$3"; shift 3
+	out="$("${B}" "$@" -- python3 "${TESTS}/tcp_client.py" "${addr}" "${port}" 2>&1)"
+	[ "${out}" = "${expect}" ] || { echo "got: ${out}"; return 1; }
+}
 
 check "echo, IPv4" sh -c "'${B}' -T 8000:'${TMP}/echo.sock' -- \
 	sh -c 'echo hi | socat -t1 - TCP:127.0.0.1:8000' | grep -qx hi"
@@ -33,12 +43,40 @@ check "echo, IPv4" sh -c "'${B}' -T 8000:'${TMP}/echo.sock' -- \
 check "echo, IPv6" sh -c "'${B}' -T 8000:'${TMP}/echo.sock' -- \
 	sh -c 'echo hi | socat -t1 - TCP:[::1]:8000' | grep -qx hi"
 
-check "echo, abstract socket" sh -c "'${B}' -T 127.0.0.1/8000:@specchio-test-$$ -- \
+check "echo, abstract socket" sh -c "'${B}' -T 8000:@specchio-test-$$ -- \
 	sh -c 'echo hi | socat -t1 - TCP:127.0.0.1:8000' | grep -qx hi"
 
 check "bulk, 20 x 50 MB each way, half-close" timeout 60 \
 	"${B}" -T 3128:"${TMP}/bulk.sock" -- \
 	python3 "${TESTS}/bulk_client.py" 3128 50000000 20
+
+check "TCP, same loopback address" tcp "127.0.0.5 18000" 127.0.0.5 18000 -T 18000
+check "TCP, IPv6 loopback" tcp "::1 18000" ::1 18000 -T 18000
+check "TCP, other port" tcp "127.0.0.1 19000" 127.0.0.1 18000 -T 18000:19000
+check "TCP, target address" tcp "::1 18000" 127.0.0.1 18000 -T 18000:::1
+check "TCP, target address and port" tcp "127.0.0.1 19000" ::1 80 -T 80:127.0.0.1/19000
+check "TCP, several -T" tcp "::1 19000" 127.0.0.1 3000 -T 2000 -T 3000:::1/19000
+
+check "TCP, refused port resets connection" sh -c "'${B}' -T 18000:20000 -- \
+	python3 '${TESTS}/tcp_client.py' 127.0.0.1 18000 2>&1 | grep -q ConnectionResetError"
+
+check "TCP, non-local target address rejected" sh -c "! '${B}' -T 18000:198.51.100.7 -- true"
+
+check "TCP, bulk, 20 x 50 MB each way, half-close" timeout 60 \
+	"${B}" -T 3128:18500 -- python3 "${TESTS}/bulk_client.py" 3128 50000000 20
+
+# A host with a non-loopback interface: simulate one in an outer namespace
+if unshare -Urn sh -c 'ip link add dummy0 type dummy' 2>/dev/null; then
+	check "TCP, address of non-loopback host interface" unshare -Urn sh -c "
+		ip link set lo up; ip link add dummy0 type dummy; ip link set dummy0 up
+		ip addr add 192.0.2.1/24 dev dummy0
+		python3 '${TESTS}/tcp_server.py' 192.0.2.1:18000 >/dev/null & sleep 0.5
+		out=\$('${B}' -T 8000:192.0.2.1/18000 -- \
+			python3 '${TESTS}/tcp_client.py' 127.0.0.1 8000)
+		kill %1; test \"\${out}\" = '192.0.2.1 18000'"
+else
+	echo "SKIP TCP, address of non-loopback host interface (no dummy interfaces)"
+fi
 
 # socat's listen backlog is 5: exercises connect() retries
 check "500 short connections, 50 concurrent" timeout 60 \

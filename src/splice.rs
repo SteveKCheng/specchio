@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Spliced connections between a TCP socket and a Unix domain socket
+//! Spliced connections between a TCP socket and a TCP or Unix domain socket
 //!
 //! Ported from tcp_splice.c in passt:
 //!   Copyright (c) 2020-2022 Red Hat GmbH
@@ -31,10 +31,10 @@
 //! the other side becomes writable (EPOLLOUT), until we read EOF from it.
 
 use std::io;
+use std::net::SocketAddr;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::ptr;
 
-use crate::config::UnixTarget;
 use crate::epoll::{Epoll, Ref};
 use crate::log::debug;
 use crate::sys::{self, cvt, retry_eintr};
@@ -61,6 +61,13 @@ const SIDE_STR: [&str; 2] = ["namespace", "host"];
 pub enum SockKind {
     Tcp,
     Unix,
+}
+
+/// Address to connect to on the host
+#[derive(Clone, Copy)]
+pub enum Peer {
+    Tcp(SocketAddr),
+    Unix(libc::sockaddr_un, libc::socklen_t),
 }
 
 pub struct Pipe {
@@ -197,7 +204,11 @@ impl Conn {
         self.closing
     }
 
-    fn fd(&self, sidei: usize) -> RawFd {
+    pub fn id(&self) -> usize {
+        self.id
+    }
+
+    pub fn fd(&self, sidei: usize) -> RawFd {
         self.s[sidei].as_ref().map_or(-1, |s| s.as_raw_fd())
     }
 
@@ -290,32 +301,61 @@ impl Conn {
         Ok(())
     }
 
-    /// Create and connect socket to @target
+    /// Create and connect socket to @peer
     ///
     /// On error, the caller should reset the connection with rst()
     ///
     /// Return: Ok(false) if the caller should call this again later, because
-    ///         the listen backlog of @target is full
-    pub fn connect(&mut self, ep: &Epoll, pool: &mut PipePool,
-                   target: &UnixTarget) -> io::Result<bool> {
-        let (sun, len) = target.sockaddr().map_err(io::Error::other)?;
+    ///         the listen backlog of a Unix domain socket @peer is full
+    pub fn connect(&mut self, ep: &Epoll, pool: &mut PipePool, peer: &Peer) -> io::Result<bool> {
         if self.s[1].is_none() {
-            self.s[1] = Some(sys::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_NONBLOCK)?);
+            let (af, kind) = match peer {
+                Peer::Tcp(SocketAddr::V4(_)) => (libc::AF_INET, SockKind::Tcp),
+                Peer::Tcp(SocketAddr::V6(_)) => (libc::AF_INET6, SockKind::Tcp),
+                Peer::Unix(..) => (libc::AF_UNIX, SockKind::Unix),
+            };
+            let s1 = sys::socket(af, libc::SOCK_STREAM | libc::SOCK_NONBLOCK)?;
 
+            if kind == SockKind::Tcp {
+                if sys::setsockopt_int(s1.as_raw_fd(), libc::SOL_TCP, libc::TCP_QUICKACK, 1)
+                    .is_err()
+                {
+                    debug!("conn {}: failed to set TCP_QUICKACK on host socket", self.id);
+                }
+                if sys::setsockopt_int(s1.as_raw_fd(), libc::SOL_TCP, libc::TCP_NODELAY, 1)
+                    .is_err()
+                {
+                    debug!("conn {}: failed to set TCP_NODELAY on host socket", self.id);
+                }
+            }
             if sys::setsockopt_int(self.fd(0), libc::SOL_TCP, libc::TCP_NODELAY, 1).is_err() {
                 debug!("conn {}: failed to set TCP_NODELAY", self.id);
             }
+
+            self.s[1] = Some(s1);
+            self.kind[1] = kind;
         }
         let raw1 = self.fd(1);
 
-        // SAFETY: sun is a valid socket address of length len
-        let rc = unsafe { libc::connect(raw1, (&sun as *const libc::sockaddr_un).cast(), len) };
+        // SAFETY: Both are valid socket addresses of the given length
+        let rc = unsafe {
+            match peer {
+                Peer::Tcp(sa) => {
+                    let (ss, len) = sys::sockaddr_ip(sa);
+                    libc::connect(raw1, (&ss as *const libc::sockaddr_storage).cast(), len)
+                }
+                Peer::Unix(sun, len) => {
+                    libc::connect(raw1, (sun as *const libc::sockaddr_un).cast(), *len)
+                }
+            }
+        };
         let err = if rc < 0 { sys::errno() } else { 0 };
 
         // A non-blocking connect() to a Unix domain socket with a full backlog
         // fails with EAGAIN, and there's no way to get notified when there's
         // room again: an unconnected socket reports EPOLLOUT | EPOLLHUP right
         // away.  Keep both sockets out of epoll, and let the caller retry.
+        // (For TCP, EAGAIN means no free local ports: retrying is fine too.)
         if err == libc::EAGAIN {
             return Ok(false);
         }

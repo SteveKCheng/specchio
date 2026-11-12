@@ -20,13 +20,12 @@
 use std::ffi::CString;
 use std::io::{self, Write as _};
 use std::mem::zeroed;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 
-use crate::config::{Bind, Config};
+use crate::config::Config;
 use crate::fdpass;
-use crate::log::debug;
 use crate::sys::{self, cvt};
 
 /// Message tags on the setup channel
@@ -51,9 +50,7 @@ pub struct Sandbox {
 ///
 /// @nofile is the original RLIMIT_NOFILE, restored for the command
 pub fn spawn(cfg: &Config, nofile: &libc::rlimit) -> io::Result<Sandbox> {
-    let binds: Vec<(usize, Bind)> = cfg.forwards.iter().enumerate()
-        .flat_map(|(i, f)| f.binds.iter().map(move |b| (i, *b)))
-        .collect();
+    let ports: Vec<u16> = cfg.forwards.iter().map(|f| f.port).collect();
 
     // Prepare everything that allocates before fork()
     let argv: Vec<CString> = cfg.command.iter()
@@ -79,7 +76,7 @@ pub fn spawn(cfg: &Config, nofile: &libc::rlimit) -> io::Result<Sandbox> {
     let pid = cvt(unsafe { libc::fork() })?;
     if pid == 0 {
         drop(ours);
-        child(theirs, uid, gid, ppid, &binds, nofile, &argvp);
+        child(theirs, uid, gid, ppid, &ports, nofile, &argvp);
     }
     drop(theirs);
 
@@ -95,21 +92,17 @@ pub fn spawn(cfg: &Config, nofile: &libc::rlimit) -> io::Result<Sandbox> {
         });
     }
 
-    // One status byte per bind: did it succeed?  Descriptors follow in order.
-    let status = &msg[1..];
-    if status.len() != binds.len() || fds.len() != status.iter().filter(|&&s| s != 0).count() {
+    // One listening socket per forward, in order
+    if msg.len() != 1 || fds.len() != ports.len() {
         reap(pid);
         return Err(io::Error::other("malformed message from sandbox"));
     }
-    let mut fds = fds.into_iter();
-    let mut listeners = Vec::new();
-    for (&(fwd, bind), &ok) in binds.iter().zip(status) {
-        if ok != 0 {
-            listeners.push(Listener { fd: fds.next().unwrap(), addr: bind.addr, fwd });
-        } else {
-            debug!("couldn't listen on {} in namespace, skipping", bind.addr);
-        }
-    }
+    let listeners = fds.into_iter().enumerate()
+        .map(|(fwd, fd)| {
+            let addr = sys::local_addr(fd.as_raw_fd())?;
+            Ok(Listener { fd, addr, fwd })
+        })
+        .collect::<io::Result<_>>()?;
 
     // SAFETY: pidfd_open() has no memory safety preconditions.  The child is
     // not reaped yet, so the PID can't be reused.
@@ -148,9 +141,9 @@ pub fn reap(pid: libc::pid_t) -> i32 {
 
 /// Body of the child process: set up the sandbox, report back, exec()
 fn child(sock: OwnedFd, uid: libc::uid_t, gid: libc::gid_t, ppid: libc::pid_t,
-         binds: &[(usize, Bind)], nofile: &libc::rlimit,
+         ports: &[u16], nofile: &libc::rlimit,
          argv: &[*const libc::c_char]) -> ! {
-    match child_setup(uid, gid, ppid, binds) {
+    match child_setup(uid, gid, ppid, ports) {
         Ok((msg, fds)) => {
             let raw: Vec<RawFd> = fds.iter().map(|f| f.as_raw_fd()).collect();
             if fdpass::send(sock.as_fd(), &msg, &raw).is_err() {
@@ -190,7 +183,7 @@ fn child(sock: OwnedFd, uid: libc::uid_t, gid: libc::gid_t, ppid: libc::pid_t,
 ///
 /// Return: message for the parent and descriptors to attach, or error string
 fn child_setup(uid: libc::uid_t, gid: libc::gid_t, ppid: libc::pid_t,
-               binds: &[(usize, Bind)]) -> Result<(Vec<u8>, Vec<OwnedFd>), String> {
+               ports: &[u16]) -> Result<(Vec<u8>, Vec<OwnedFd>), String> {
     // SAFETY: unshare() has no memory safety preconditions
     cvt(unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) })
         .map_err(|e| format!("cannot create namespaces: {e}"))?;
@@ -219,20 +212,12 @@ fn child_setup(uid: libc::uid_t, gid: libc::gid_t, ppid: libc::pid_t,
 
     loopback_up().map_err(|e| format!("cannot bring up loopback interface: {e}"))?;
 
-    let mut msg = vec![MSG_OK];
-    let mut fds = Vec::new();
-    for (_, bind) in binds {
-        match listen(&bind.addr) {
-            Ok(fd) => {
-                msg.push(1);
-                fds.push(fd);
-            }
-            Err(_) if bind.best_effort => msg.push(0),
-            Err(e) => return Err(format!("cannot listen on {} in namespace: {e}", bind.addr)),
-        }
-    }
+    let fds = ports.iter()
+        .map(|&port| listen(port)
+             .map_err(|e| format!("cannot listen on port {port} in namespace: {e}")))
+        .collect::<Result<_, _>>()?;
 
-    Ok((msg, fds))
+    Ok((vec![MSG_OK], fds))
 }
 
 fn write_proc(path: &str, content: &str) -> io::Result<()> {
@@ -256,15 +241,33 @@ fn loopback_up() -> io::Result<()> {
     Ok(())
 }
 
-/// Create a non-blocking TCP socket listening on @addr
-fn listen(addr: &SocketAddr) -> io::Result<OwnedFd> {
+/// Create a non-blocking TCP socket listening on @port, on the loopback
+/// interface, dual-stack if IPv6 is available, like pasta does for -T
+fn listen(port: u16) -> io::Result<OwnedFd> {
+    match listen_on(&SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port)) {
+        Err(e) if matches!(e.raw_os_error(), Some(libc::EAFNOSUPPORT | libc::EADDRNOTAVAIL)) => {
+            listen_on(&SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port))
+        }
+        r => r,
+    }
+}
+
+fn listen_on(addr: &SocketAddr) -> io::Result<OwnedFd> {
     let af = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
     let s = sys::socket(af, libc::SOCK_STREAM | libc::SOCK_NONBLOCK)?;
 
     sys::setsockopt_int(s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_REUSEADDR, 1)?;
     if addr.is_ipv6() {
-        sys::setsockopt_int(s.as_raw_fd(), libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, 1)?;
+        sys::setsockopt_int(s.as_raw_fd(), libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, 0)?;
     }
+
+    // Only lo exists now, but the command could add interfaces (it has
+    // CAP_NET_ADMIN in the namespace): don't accept connections from those
+    // SAFETY: Passing a valid buffer and its length
+    cvt(unsafe {
+        libc::setsockopt(s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_BINDTODEVICE,
+                         c"lo".as_ptr().cast(), 3)
+    })?;
 
     let (sa, len) = sys::sockaddr_ip(addr);
     // SAFETY: sa is a valid socket address of length len
