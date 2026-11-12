@@ -182,6 +182,41 @@ pub fn set_pipe_size(fd: BorrowedFd, size: usize) -> io::Result<usize> {
     Ok(ret as usize)
 }
 
+/// Drop descriptors inherited from our parent, once the command has its copies
+///
+/// Point standard input and output to /dev/null, and close all descriptors
+/// above standard error except for @keep, so that we don't keep files, pipes
+/// or sockets open for longer than the command does.  For example, a reader
+/// of the command's standard output should see EOF when the command closes
+/// it, not only once we exit.  Standard error is kept for logging.
+pub fn drop_inherited(keep: &[RawFd]) -> io::Result<()> {
+    let null = std::fs::OpenOptions::new().read(true).write(true).open("/dev/null")?;
+    for fd in [libc::STDIN_FILENO, libc::STDOUT_FILENO] {
+        // SAFETY: dup2() onto standard streams, nothing else refers to them
+        cvt(unsafe { libc::dup2(null.as_raw_fd(), fd) })?;
+    }
+    drop(null);
+
+    let mut keep: Vec<RawFd> = keep.iter().copied().filter(|&fd| fd > libc::STDERR_FILENO).collect();
+    keep.sort_unstable();
+
+    // Close the ranges between descriptors we keep
+    let mut first = libc::STDERR_FILENO as libc::c_uint + 1;
+    for last in keep.iter().map(|&fd| fd as libc::c_uint).chain([libc::c_uint::MAX]) {
+        if last > first {
+            let end = if last == libc::c_uint::MAX { last } else { last - 1 };
+            // SAFETY: close_range() has no memory safety preconditions, and we
+            // don't own any descriptor in this range
+            if unsafe { libc::syscall(libc::SYS_close_range, first, end, 0) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        first = last.saturating_add(1);
+    }
+
+    Ok(())
+}
+
 /// Raise the soft limit on open files to the hard limit, return the old limit
 pub fn raise_nofile() -> io::Result<(libc::rlimit, usize)> {
     // SAFETY: All-zero is a valid rlimit

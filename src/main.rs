@@ -269,6 +269,18 @@ fn run(cfg: Config) -> Result<u8, String> {
     let Sandbox { pid, pidfd, listeners } = sandbox::spawn(&cfg, &nofile_orig)
         .map_err(|e| format!("cannot start sandbox: {e}"))?;
 
+    // The command has its copies of whatever we inherited: drop ours
+    let keep: Vec<_> = listeners.iter().map(|l| l.fd.as_raw_fd())
+        .chain([pidfd.as_raw_fd()])
+        .collect();
+    match sys::drop_inherited(&keep) {
+        // close_range() needs Linux 5.9: carry on, as pasta does
+        Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {
+            info!("can't use close_range(), inherited files stay open");
+        }
+        r => r.map_err(|e| format!("cannot close inherited files: {e}"))?,
+    }
+
     // Like a shell waiting for a foreground job, leave terminal-generated
     // signals to the command: if we terminate, so does the command.
     // SAFETY: Setting signal dispositions to SIG_IGN

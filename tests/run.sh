@@ -102,6 +102,21 @@ try: s.recv(1)
 except ConnectionResetError: pass
 else: raise SystemExit(1)'
 
+# Inherited descriptors go to the command, and the parent doesn't keep them
+check "inherited files: passed on, not kept" sh -c "
+	touch '${TMP}/marker'
+	'${B}' -T 18000 -- sh -c 'test -e /proc/self/fd/5 && test -e /proc/self/fd/9 &&
+		touch ${TMP}/ok; sleep 1' 5<'${TMP}/marker' 9<'${TMP}/marker' & pid=\$!
+	sleep 0.5; fds=\$(ls -l /proc/\${pid}/fd); wait \${pid}
+	test -e '${TMP}/ok' && ! echo \"\${fds}\" | grep -q marker &&
+	test \"\$(readlink /proc/\${pid}/fd/1 2>/dev/null || echo gone)\" != '${TMP}/marker'"
+
+check "reader sees EOF when command closes standard output" sh -c "
+	start=\$(date +%s%N)
+	'${B}' -- sh -c 'echo line; exec >&-; sleep 2' |
+		{ cat >/dev/null; echo \$(( (\$(date +%s%N) - start) / 1000000 )) > '${TMP}/eof_ms'; }
+	test \$(cat '${TMP}/eof_ms') -lt 1000"
+
 check "exit status passed through" sh -c "'${B}' -- sh -c 'exit 7'; test \$? -eq 7"
 
 check "no descriptors leaked to command" sh -c "'${B}' -T 8000:'${TMP}/echo.sock' -- \

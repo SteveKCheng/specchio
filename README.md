@@ -55,7 +55,14 @@ Compared to `pasta`:
 - Unix domain socket targets are a specchio extension. A target starting with
   `/`, `./`, `../` or `@` can't be a port or an address in `pasta`'s syntax.
 
-With no command, specchio runs `$SHELL`. It exits with the command's exit
+With no command, specchio runs `$SHELL`. The command inherits all of
+specchio's open files, such as sockets from systemd socket activation. Once
+the command is started, specchio itself drops them: it points standard input
+and output to `/dev/null` and closes the rest, keeping only standard error for
+its messages. So a reader of the command's output sees EOF as soon as the
+command closes it, not only once specchio exits. (`pasta` instead closes
+everything except standard streams at startup, so the command never gets
+them.) It exits with the command's exit
 status (128 + signal number if the command was killed).
 
 ## How it works
