@@ -38,12 +38,12 @@ with `none` only, as no-ops, so that `pasta` command lines like
 
 Compared to `pasta`:
 
-- `auto` isn't supported, and won't be: it forwards whatever the sandbox
-  happens to listen on, and the point of specchio is to grant access
-  explicitly.
+- `auto` and `all` aren't supported, and won't be: they forward whatever the
+  sandbox happens to listen on, or every port, and the point of specchio is
+  to grant access explicitly.
 
-- Not supported yet: port ranges, lists (`80,443`), exclusions (`~80`) and
-  `all`. Each is rejected with an error.
+- Not supported yet: port ranges, lists (`80,443`) and exclusions (`~80`).
+  Each is rejected with an error.
 - As with `pasta`, a listening address (`ADDR/PORT`) isn't allowed for `-T`.
   specchio listens on all addresses (dual-stack), bound to `lo` with
   `SO_BINDTODEVICE`.

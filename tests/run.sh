@@ -61,7 +61,7 @@ check "TCP, pasta-style options" tcp "127.0.0.1 18000" 127.0.0.1 18000 \
 	-t none -u none -U none --tcp-ports=none --udp-ports=none --udp-ns=none \
 	-T none -T 18000
 
-check "auto rejected" sh -c "! '${B}' -T auto -- true"
+check "auto and all rejected" sh -c "! '${B}' -T auto -- true && ! '${B}' -t all -- true"
 
 check "TCP, refused port resets connection" sh -c "'${B}' -T 18000:20000 -- \
 	python3 '${TESTS}/tcp_client.py' 127.0.0.1 18000 2>&1 | grep -q ConnectionResetError"

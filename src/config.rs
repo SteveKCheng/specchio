@@ -153,7 +153,7 @@ fn parse_ip(s: &[u8]) -> Option<IpAddr> {
     std::str::from_utf8(s).ok()?.parse().ok()
 }
 
-/// Find "auto" in a port specifier: [ADDR/]auto,...
+/// Find "auto" or "all" in a port specifier: [ADDR/]{auto,all[:TOADDR]},...
 ///
 /// Return: an error message if found
 fn wildcard(spec: &[u8]) -> Option<String> {
@@ -163,7 +163,7 @@ fn wildcard(spec: &[u8]) -> Option<String> {
             None => chunk,
         };
         let keyword = rest.split(|&b| b == b':').next().unwrap_or(rest);
-        if keyword == b"auto" {
+        if keyword == b"auto" || keyword == b"all" {
             return Some(format!("'{}' isn't supported, by design: forward ports explicitly",
                                 String::from_utf8_lossy(keyword)));
         }
@@ -195,9 +195,7 @@ fn parse_forward(spec: &[u8]) -> Result<Option<Forward>, String> {
         if port.contains(&b'/') || port.contains(&b'%') || parse_ip(port).is_some() {
             return Err(bad("listening address not allowed for -T"));
         }
-        if port.contains(&b'-') || port.contains(&b',') || port.starts_with(b"~")
-            || port == b"all"
-        {
+        if port.contains(&b'-') || port.contains(&b',') || port.starts_with(b"~") {
             return Err(bad("only single ports are supported"));
         }
         return Err(bad("bad port"));
@@ -440,8 +438,9 @@ mod tests {
     }
 
     #[test]
-    fn auto() {
-        for spec in ["auto", "::1/auto", "8000-8010,auto"] {
+    fn wildcards() {
+        for spec in ["auto", "::1/auto", "8000-8010,auto", "all", "all:192.0.2.1",
+                     "127.0.0.6/all:192.0.2.6", "::1/all", "~80,all"] {
             for opt in ["-T", "-t", "-u", "-U"] {
                 let e = parse([opt, spec].iter().map(OsString::from)).unwrap_err();
                 assert!(e.contains("by design"), "{opt} {spec}: {e}");
