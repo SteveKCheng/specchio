@@ -4,9 +4,9 @@ Notes from investigating whether `pasta` (from [passt](https://passt.top/))
 could be extended to splice sandbox connections to host Unix domain sockets,
 before we decided to write specchio instead. Collected 2026-11-12.
 
-Source references are to passt as checked out in `/home/steve/dev/passt`,
-upstream commit `6aa4f88` ("passt-repair: Suppress false positive cppcheck
-negativeIndex warning"). Line numbers will drift.
+Source references to passt are as of upstream `6aa4f88` 
+("passt-repair: Suppress false positive cppcheck negativeIndex warning"). 
+Line numbers will drift for other versions.
 
 Contents:
 
@@ -21,9 +21,9 @@ Contents:
 
 ## 1. Earlier Q&A with Gemini, annotated
 
-The original Q&A is in `/home/steve/dev/passt/notes/splicing.md` (branch
-`splice` of the passt checkout). It's reproduced here because it records what
-we considered before going off to write our own tool. Gemini's answers are
+The original Q&A was conducted on the possibility of modifying `pasta`.
+We reproduce it here to records what we considered before going off to 
+write our own tool. Gemini's answers are
 kept as they were, except that wrong or misleading parts are ~~struck
 through~~, each followed by a **Correction**. Parts that were checked and
 found right are left alone, sometimes with a **Note**.
