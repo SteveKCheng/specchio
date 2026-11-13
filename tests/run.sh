@@ -66,6 +66,18 @@ check "auto and all rejected" sh -c "! '${B}' -T auto -- true && ! '${B}' -t all
 check "TCP, refused port resets connection" sh -c "'${B}' -T 18000:20000 -- \
 	python3 '${TESTS}/tcp_client.py' 127.0.0.1 18000 2>&1 | grep -q ConnectionResetError"
 
+check "TCP, host name" sh -c "'${B}' -T 8000:localhost/18000 -- \
+	python3 '${TESTS}/tcp_client.py' 127.0.0.1 8000 | grep -Eqx '(127.0.0.1|::1) 18000'"
+
+# In a new network namespace, so that no DNS queries leave the machine
+check "unresolvable host name rejected at start-up" unshare -Urn sh -c "
+	! '${B}' -T 8000:nonexistent.invalid -- true 2>'${TMP}/err' &&
+	grep -q \"cannot resolve 'nonexistent.invalid'\" '${TMP}/err'"
+
+check "hint for Unix socket name without ./" unshare -Urn sh -c "cd '${TMP}' &&
+	! '${B}' -T 8000:echo.sock -- true 2>'${TMP}/err' &&
+	grep -q \"use './echo.sock'\" '${TMP}/err'"
+
 check "TCP, bulk, 20 x 50 MB each way, half-close" timeout 60 \
 	"${B}" -T 3128:18500 -- python3 "${TESTS}/bulk_client.py" 3128 50000000 20
 
@@ -90,6 +102,12 @@ remote() {
 
 if unshare -Urn sh -c 'ip link add veth0 type veth peer name veth1' 2>/dev/null; then
 	remote "TCP, other host" "" 198.51.100.2/18000 "198.51.100.2 18000"
+	remote "TCP, other host by name" "198.51.100.2 remote.test\\n" \
+		remote.test/18000 "198.51.100.2 18000" "remote.test resolves to 198.51.100.2$"
+	remote "TCP, other host by name, first address refused" \
+		"198.51.100.3 remote.test\\n198.51.100.2 remote.test\\n" \
+		remote.test/18000 "198.51.100.2 18000" \
+		"198.51.100.3:18000: Connection refused.*trying next address"
 	remote "TCP, no route to other host resets connection" "" 203.0.113.1/18000 "" \
 		"cannot connect to 203.0.113.1:18000: Network is unreachable" \
 		"ConnectionResetError"

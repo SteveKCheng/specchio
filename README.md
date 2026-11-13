@@ -30,6 +30,7 @@ This uses `pasta`'s syntax, one port per option; `-T` can be repeated:
 | `-T 8080:9090` | same | the same loopback address, port 9090 |
 | `-T 8080:192.0.2.1` | same | `192.0.2.1`, port 8080 |
 | `-T 8080:192.0.2.1/9090` | same | `192.0.2.1`, port 9090 |
+| `-T 2222:build.lan/22` | same | `build.lan`, resolved at start-up, port 22 (`-T 22:build.lan` for port 22 to 22) |
 | `-T 3128:/run/proxy.sock` | same | Unix socket (also `./rel/path`, `../rel/path`; `@name` for abstract sockets) |
 
 `-t`/`--tcp-ports`, `-u`/`--udp-ports` and `-U`/`--udp-ns` are accepted
@@ -54,8 +55,20 @@ Compared to `pasta`:
   connects from the host's network namespace, as any other process there
   would. Unspecified addresses (`0.0.0.0`, `::`) mean "automatic", as in
   `pasta`.
+- Host name targets are a specchio extension. Names are resolved once, with
+  `getaddrinfo()` (so `/etc/hosts` and the rest of NSS apply), before the
+  sandbox starts, and an unresolvable name is an error. The addresses aren't
+  looked up again while specchio runs. Each connection tries them in the
+  order `getaddrinfo()` gives (RFC 6724, `gai.conf`) until one connects.
+  An address that doesn't answer at all holds a connection up until the
+  kernel gives up on it (`tcp_syn_retries`, about two minutes by default);
+  there's no Happy Eyeballs. A name is dot-separated labels of letters,
+  digits, `-` and `_`; one whose last label is numeric is rejected as a
+  mistyped IPv4 address.
 - Unix domain socket targets are a specchio extension. A target starting with
   `/`, `./`, `../` or `@` can't be a port or an address in `pasta`'s syntax.
+  Without such a prefix, `proxy.sock` is a host name: if resolving it fails
+  and a file of that name exists, the error message suggests `./proxy.sock`.
 
 With no command, specchio runs `$SHELL`. The command inherits all of
 specchio's open files, such as sockets from systemd socket activation. Once

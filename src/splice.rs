@@ -148,6 +148,10 @@ fn probe_pipe_size() -> usize {
 pub struct Conn {
     /// Index in the connection table, used for epoll references and logging
     id: usize,
+    /// Index of the forward the connection came from
+    fwd: usize,
+    /// Index of the target address being tried, see connect_reset()
+    attempt: usize,
     s: [Option<OwnedFd>; 2],
     kind: [SockKind; 2],
     /// Pipe for data from side i to side !i
@@ -184,12 +188,14 @@ fn conn_epoll_events(events: u8, sidei: usize) -> u32 {
 
 impl Conn {
     /// New connection from accepted (TCP) socket @s0
-    pub fn new(id: usize, s0: OwnedFd) -> Self {
+    pub fn new(id: usize, fwd: usize, s0: OwnedFd) -> Self {
         if sys::setsockopt_int(s0.as_raw_fd(), libc::SOL_TCP, libc::TCP_QUICKACK, 1).is_err() {
             debug!("conn {id}: failed to set TCP_QUICKACK");
         }
         Conn {
             id,
+            fwd,
+            attempt: 0,
             s: [Some(s0), None],
             kind: [SockKind::Tcp, SockKind::Unix],
             pipe: [None, None],
@@ -206,6 +212,14 @@ impl Conn {
 
     pub fn id(&self) -> usize {
         self.id
+    }
+
+    pub fn fwd(&self) -> usize {
+        self.fwd
+    }
+
+    pub fn attempt(&self) -> usize {
+        self.attempt
     }
 
     pub fn fd(&self, sidei: usize) -> RawFd {
@@ -374,6 +388,16 @@ impl Conn {
         Ok(true)
     }
 
+    /// Undo a failed connect(), so that it can be called again for the next
+    /// address of the target (attempt() is incremented)
+    pub fn connect_reset(&mut self, ep: &Epoll) {
+        ep.delete(self.fd(0));
+        ep.delete(self.fd(1));
+        self.s[1] = None;
+        self.events = SPLICE_CLOSED;
+        self.attempt += 1;
+    }
+
     /// Forward data in one direction using splice()
     ///
     /// Return: Err(()) if the connection should be reset
@@ -488,7 +512,24 @@ impl Conn {
     }
 
     /// Handle epoll @events on socket of side @sidei
-    pub fn handle(&mut self, ep: &Epoll, pool: &mut PipePool, sidei: usize, events: u32) {
+    ///
+    /// Return: error if connect() failed: the caller should call connect_reset()
+    ///         and try another address, or rst()
+    pub fn handle(&mut self, ep: &Epoll, pool: &mut PipePool, sidei: usize, events: u32)
+                  -> Option<io::Error> {
+        if sidei == 1 && self.events == SPLICE_CONNECT && !self.closing
+            && events & libc::EPOLLERR as u32 != 0
+        {
+            return Some(match sys::so_error(self.fd(1)) {
+                Ok(err) => io::Error::from_raw_os_error(err),
+                Err(e) => e,
+            });
+        }
+        self.handle_events(ep, pool, sidei, events);
+        None
+    }
+
+    fn handle_events(&mut self, ep: &Epoll, pool: &mut PipePool, sidei: usize, events: u32) {
         if self.closing || self.events == SPLICE_CLOSED {
             return;
         }

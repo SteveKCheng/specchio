@@ -133,13 +133,14 @@ impl Forwarder {
             self.nconns += 1;
 
             let fwd = self.listeners[li].fwd;
-            let mut conn = Conn::new(id, s);
+            let mut conn = Conn::new(id, fwd, s);
 
             match peer(&self.targets[fwd], &conn) {
-                Ok(peer) => {
+                Ok(Some(peer)) => {
                     self.conns[id] = Some(conn);
                     self.connect(id, fwd, peer, None);
                 }
+                Ok(None) => unreachable!("no address for first attempt"),
                 Err(e) => {
                     info!("conn {id}: cannot connect to {}: {e}", self.targets[fwd]);
                     conn.rst(&self.ep);
@@ -179,14 +180,36 @@ impl Forwarder {
                     self.retries.push(*r);
                 }
             }
-            Err(e) => {
-                info!("conn {id}: cannot connect to {target}: {e}");
-                conn.rst(&self.ep);
-            }
+            Err(e) => return self.connect_failed(id, e),
         }
 
         if conn.is_closing() {
             self.defer.push(id);
+        }
+    }
+
+    /// connect() failed for connection @id with @e: try the next address of
+    /// the target if there is one, reset the connection otherwise
+    fn connect_failed(&mut self, id: usize, e: std::io::Error) {
+        let Some(conn) = self.conns[id].as_mut() else { return };
+        let fwd = conn.fwd();
+        let target = &self.targets[fwd];
+        let failed = match target {
+            Target::Host { addrs, .. } => addrs[conn.attempt()].to_string(),
+            _ => target.to_string(),
+        };
+
+        conn.connect_reset(&self.ep);
+        match peer(target, conn) {
+            Ok(Some(next)) => {
+                debug!("conn {id}: cannot connect to {failed}: {e}, trying next address");
+                self.connect(id, fwd, next, None);
+            }
+            Ok(None) | Err(_) => {
+                info!("conn {id}: cannot connect to {target}: {e}");
+                conn.rst(&self.ep);
+                self.defer.push(id);
+            }
         }
     }
 
@@ -213,7 +236,9 @@ impl Forwarder {
 
     fn conn_event(&mut self, id: usize, sidei: usize, events: u32) {
         let Some(conn) = self.conns.get_mut(id).and_then(Option::as_mut) else { return };
-        conn.handle(&self.ep, &mut self.pool, sidei, events);
+        if let Some(e) = conn.handle(&self.ep, &mut self.pool, sidei, events) {
+            return self.connect_failed(id, e);
+        }
         if conn.is_closing() {
             self.defer.push(id);
         }
@@ -232,8 +257,14 @@ impl Forwarder {
     }
 }
 
-/// Find the address to connect to on the host for a new connection
-fn peer(target: &Target, conn: &Conn) -> std::io::Result<Peer> {
+/// Find the address to connect to on the host for connection @conn, for
+/// its current attempt(): targets given by host name can have several
+///
+/// Return: None if there are no addresses left to try
+fn peer(target: &Target, conn: &Conn) -> std::io::Result<Option<Peer>> {
+    if conn.attempt() > 0 && !matches!(target, Target::Host { .. }) {
+        return Ok(None);
+    }
     let peer = match target {
         Target::Unix(u) => {
             let (sun, len) = u.sockaddr().map_err(std::io::Error::other)?;
@@ -245,16 +276,31 @@ fn peer(target: &Target, conn: &Conn) -> std::io::Result<Peer> {
             let local = sys::local_addr(conn.fd(0))?;
             Peer::Tcp(SocketAddr::new(local.ip(), *port))
         }
+        Target::Host { addrs, .. } => match addrs.get(conn.attempt()) {
+            Some(a) => Peer::Tcp(*a),
+            None => return Ok(None),
+        },
     };
 
-    match &peer {
-        Peer::Tcp(a) => debug!("conn {}: accepted, connecting to {a}", conn.id()),
-        Peer::Unix(..) => debug!("conn {}: accepted, connecting to {target}", conn.id()),
+    if conn.attempt() == 0 {
+        match &peer {
+            Peer::Tcp(a) => debug!("conn {}: accepted, connecting to {a}", conn.id()),
+            Peer::Unix(..) => debug!("conn {}: accepted, connecting to {target}", conn.id()),
+        }
     }
-    Ok(peer)
+    Ok(Some(peer))
 }
 
-fn run(cfg: Config) -> Result<u8, String> {
+
+fn run(mut cfg: Config) -> Result<u8, String> {
+    cfg.resolve()?;
+    for f in &cfg.forwards {
+        if let Target::Host { name, addrs, .. } = &f.target {
+            let list: Vec<_> = addrs.iter().map(|a| a.ip().to_string()).collect();
+            debug!("{name} resolves to {}", list.join(", "));
+        }
+    }
+
     let (nofile_orig, nofile) = sys::raise_nofile()
         .map_err(|e| format!("cannot get file descriptor limit: {e}"))?;
 

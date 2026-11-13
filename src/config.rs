@@ -5,7 +5,7 @@
 use std::ffi::OsString;
 use std::fmt;
 use std::mem::{offset_of, size_of, zeroed};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 
@@ -28,6 +28,8 @@ Options:
                                       port TOPORT (default: PORT)
                         TOADDR[/TOPORT]
                                       IP address, port TOPORT (default: PORT)
+                        HOSTNAME[/TOPORT]
+                                      host name, resolved once at start-up
                         /path/to/socket, ./relative/path, @abstract-name
                                       Unix domain socket on the host
                       can be given multiple times
@@ -43,6 +45,7 @@ Examples:
   specchio -T 3128:/run/user/1000/proxy.sock -- \\
       env https_proxy=http://127.0.0.1:3128 curl https://example.com/
   specchio -T 8080 -T 5432:192.0.2.1/5433 -- my-agent
+  specchio -T 2222:build.lan/22 -- ssh -p 2222 127.0.0.1
 ";
 
 /// Host side Unix domain socket to connect to
@@ -113,6 +116,8 @@ impl fmt::Display for UnixTarget {
 pub enum Target {
     /// TCP port, at @addr, or at the address connected to in the namespace
     Tcp { addr: Option<IpAddr>, port: u16 },
+    /// TCP port on host @name, with @addrs filled in by Config::resolve()
+    Host { name: String, port: u16, addrs: Vec<SocketAddr> },
     Unix(UnixTarget),
 }
 
@@ -121,6 +126,7 @@ impl fmt::Display for Target {
         match self {
             Target::Tcp { addr: Some(a), port } => write!(f, "{}", SocketAddr::new(*a, *port)),
             Target::Tcp { addr: None, port } => write!(f, "port {port} on loopback"),
+            Target::Host { name, port, .. } => write!(f, "{name}:{port}"),
             Target::Unix(u) => write!(f, "{u}"),
         }
     }
@@ -151,6 +157,29 @@ fn parse_port(s: &[u8]) -> Option<u16> {
 
 fn parse_ip(s: &[u8]) -> Option<IpAddr> {
     std::str::from_utf8(s).ok()?.parse().ok()
+}
+
+/// Check that @s looks like a host name: dot-separated labels of letters,
+/// digits, '-' and '_' (seen in practice), optionally ending with a dot
+fn parse_hostname(s: &[u8]) -> Option<String> {
+    let name = s.strip_suffix(b".").unwrap_or(s);
+    if name.is_empty() || name.len() > 253 {
+        return None;
+    }
+    let label_ok = |l: &[u8]| {
+        (1..=63).contains(&l.len()) && !l.starts_with(b"-") && !l.ends_with(b"-")
+            && l.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    };
+    if !name.split(|&b| b == b'.').all(label_ok) {
+        return None;
+    }
+    // A numeric last label means a mistyped IPv4 address, not a name: don't
+    // let getaddrinfo() make one of it (inet_aton() takes "10.1" or "0x7f.1")
+    let last = name.rsplit(|&b| b == b'.').next()?;
+    if last.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    String::from_utf8(s.to_vec()).ok()
 }
 
 /// Find "auto" or "all" in a port specifier: [ADDR/]{auto,all[:TOADDR]},...
@@ -218,15 +247,21 @@ fn parse_forward(spec: &[u8]) -> Result<Option<Forward>, String> {
                 }
                 None => (Some(t), port),
             };
-            let addr = match addr {
-                Some(a) => Some(parse_ip(a).ok_or_else(|| {
-                    bad("target must be a port, an IP address, or a Unix socket path \
-                         starting with '/', './', '../' or '@'")
-                })?),
-                None => None,
-            };
-            // Unspecified target address means automatic, as with pasta
-            Target::Tcp { addr: addr.filter(|a| !a.is_unspecified()), port: toport }
+            match addr.map(|a| (a, parse_ip(a))) {
+                // Unspecified target address means automatic, as with pasta
+                Some((_, Some(a))) if !a.is_unspecified() => {
+                    Target::Tcp { addr: Some(a), port: toport }
+                }
+                None | Some((_, Some(_))) => Target::Tcp { addr: None, port: toport },
+                Some((a, None)) => Target::Host {
+                    name: parse_hostname(a).ok_or_else(|| {
+                        bad("target must be a port, an IP address, a host name, or a Unix \
+                             socket path starting with '/', './', '../' or '@'")
+                    })?,
+                    port: toport,
+                    addrs: Vec::new(),
+                },
+            }
         }
     };
 
@@ -356,6 +391,33 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Config>,
     Ok(Some(cfg))
 }
 
+impl Config {
+    /// Resolve host name targets, once: blocking is fine before we start
+    pub fn resolve(&mut self) -> Result<(), String> {
+        for f in &mut self.forwards {
+            let Target::Host { name, port, addrs } = &mut f.target else { continue };
+            let res = (name.as_str(), *port).to_socket_addrs();
+            let mut found: Vec<SocketAddr> = res.map_err(|e| {
+                // A Unix socket in the current directory, without "./"?
+                let hint = if std::path::Path::new(name.as_str()).exists() {
+                    format!(" (for the Unix socket in the current directory, use './{name}')")
+                } else {
+                    String::new()
+                };
+                format!("cannot resolve '{name}': {e}{hint}")
+            })?.collect();
+            // Keep getaddrinfo()'s order (RFC 6724 and gai.conf), drop duplicates
+            let mut seen = Vec::new();
+            found.retain(|a| { let new = !seen.contains(a); seen.push(*a); new });
+            if found.is_empty() {
+                return Err(format!("cannot resolve '{name}': no addresses"));
+            }
+            *addrs = found;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,6 +446,34 @@ mod tests {
     }
 
     #[test]
+    fn host_targets() {
+        let host = |spec: &str| match fwd(spec) {
+            Forward { port, target: Target::Host { name, port: to, addrs } } => {
+                assert!(addrs.is_empty());
+                (port, name, to)
+            }
+            f => panic!("not a host target: {f:?}"),
+        };
+        assert_eq!(host("2222:build.lan/22"), (2222, "build.lan".into(), 22));
+        assert_eq!(host("8080:example.com"), (8080, "example.com".into(), 8080));
+        assert_eq!(host("8080:example.com."), (8080, "example.com.".into(), 8080));
+        assert_eq!(host("22:x"), (22, "x".into(), 22));
+        assert_eq!(host("22:proxy.sock"), (22, "proxy.sock".into(), 22));
+        assert_eq!(host("22:_srv.a-b.1x/23"), (22, "_srv.a-b.1x".into(), 23));
+        assert!(parse_forward(format!("1:{}.a", "x".repeat(64)).as_bytes()).is_err());
+    }
+
+    #[test]
+    fn resolve_localhost() {
+        let mut cfg = Config { forwards: vec![fwd("8080:localhost/80"), fwd("80:192.0.2.1")],
+                               debug: false, command: Vec::new() };
+        cfg.resolve().unwrap();
+        let Target::Host { addrs, .. } = &cfg.forwards[0].target else { panic!() };
+        assert!(!addrs.is_empty());
+        assert!(addrs.iter().all(|a| a.ip().is_loopback() && a.port() == 80));
+    }
+
+    #[test]
     fn unix_targets() {
         let f = fwd("3128:/run/proxy.sock");
         assert_eq!(f.port, 3128);
@@ -396,8 +486,10 @@ mod tests {
 
     #[test]
     fn invalid() {
-        for spec in ["", "0", "70000", "8080:", "8080:0", "8080:x", "8080:proxy.sock",
-                     "8080:192.0.2.1/", "8080:192.0.2.1/x", "8080:[::1]/80",
+        for spec in ["", "0", "70000", "8080:", "8080:0", "8080:x!", "8080:-x", "8080:a..b",
+                     "8080:.a", "8080:a-.b", "8080:1.2.3", "8080:300.1.1.1", "8080:0x7f.1",
+                     "8080:a.b/x", "8080:a b", "8080:192.0.2.1/", "8080:192.0.2.1/x",
+                     "8080:[::1]/80",
                      "127.0.0.1/8080", "::1/8080:/a", "%lo/8080", "80-90", "80,81",
                      "~80", "all", "auto"] {
             assert!(parse_forward(spec.as_bytes()).is_err(), "'{spec}' should be invalid");
