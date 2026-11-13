@@ -3,7 +3,8 @@
 *Specchio* (Italian for "mirror") is a narrowly scoped relative of `pasta`
 from [passt](https://passt.top/). It runs a command in new user and network
 namespaces where only `lo` exists, and forwards chosen TCP ports inside them
-to TCP ports or Unix domain sockets on the host. Data moves only by
+to TCP ports on the host or other hosts, or to Unix domain sockets on the
+host. Data moves only by
 `splice()`, and there is no TAP interface, no packet parsing and no `fork()`
 per connection. The goal is to cover all of `pasta`'s splicing (TCP and UDP,
 in both directions); so far, TCP from the sandbox to the host works.
@@ -49,9 +50,10 @@ Compared to `pasta`:
   `SO_BINDTODEVICE`.
 - The target address is honoured. `pasta` parses it for `-T`, but
   `fwd_nat_from_splice()` ignores it and always uses the same loopback
-  address. It must be the address of a host interface, which is
-  checked at startup; other hosts can't be reached. Unspecified addresses
-  (`0.0.0.0`, `::`) mean "automatic", as in `pasta`.
+  address. It can be any address, of the host or another host: specchio
+  connects from the host's network namespace, as any other process there
+  would. Unspecified addresses (`0.0.0.0`, `::`) mean "automatic", as in
+  `pasta`.
 - Unix domain socket targets are a specchio extension. A target starting with
   `/`, `./`, `../` or `@` can't be a port or an address in `pasta`'s syntax.
 

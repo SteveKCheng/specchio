@@ -27,7 +27,7 @@ Options:
                                       the one connected to in the namespace,
                                       port TOPORT (default: PORT)
                         TOADDR[/TOPORT]
-                                      address of a host interface
+                                      IP address, port TOPORT (default: PORT)
                         /path/to/socket, ./relative/path, @abstract-name
                                       Unix domain socket on the host
                       can be given multiple times

@@ -4,7 +4,7 @@
 
 use std::io;
 use std::mem::{size_of, zeroed};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 
 /// Turn a C-style `-1` return value into an `io::Error` from `errno`
@@ -153,17 +153,6 @@ pub fn local_addr(fd: RawFd) -> io::Result<SocketAddr> {
     // SAFETY: Passing a valid buffer and its length
     cvt(unsafe { libc::getsockname(fd, (&mut ss as *mut libc::sockaddr_storage).cast(), &mut len) })?;
     sockaddr_to_ip(&ss).ok_or_else(|| io::Error::other("not an IP socket"))
-}
-
-/// Check that @addr is assigned to an interface, by binding a socket to it
-pub fn check_local_addr(addr: IpAddr) -> io::Result<()> {
-    let sa = SocketAddr::new(addr, 0);
-    let af = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
-    let s = socket(af, libc::SOCK_STREAM)?;
-    let (ss, len) = sockaddr_ip(&sa);
-    // SAFETY: ss is a valid socket address of length len
-    cvt(unsafe { libc::bind(s.as_raw_fd(), (&ss as *const libc::sockaddr_storage).cast(), len) })
-        .map(drop)
 }
 
 /// Create a non-blocking pipe, return (read end, write end)

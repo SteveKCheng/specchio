@@ -66,8 +66,6 @@ check "auto and all rejected" sh -c "! '${B}' -T auto -- true && ! '${B}' -t all
 check "TCP, refused port resets connection" sh -c "'${B}' -T 18000:20000 -- \
 	python3 '${TESTS}/tcp_client.py' 127.0.0.1 18000 2>&1 | grep -q ConnectionResetError"
 
-check "TCP, non-local target address rejected" sh -c "! '${B}' -T 18000:198.51.100.7 -- true"
-
 check "TCP, bulk, 20 x 50 MB each way, half-close" timeout 60 \
 	"${B}" -T 3128:18500 -- python3 "${TESTS}/bulk_client.py" 3128 50000000 20
 
@@ -82,6 +80,21 @@ if unshare -Urn sh -c 'ip link add dummy0 type dummy' 2>/dev/null; then
 		kill %1; test \"\${out}\" = '192.0.2.1 18000'"
 else
 	echo "SKIP TCP, address of non-loopback host interface (no dummy interfaces)"
+fi
+
+# Another host, behind a veth pair, see remote.sh
+remote() {
+	name="$1"; shift
+	check "${name}" unshare -Urnm sh "${TESTS}/remote.sh" "${B}" "${TMP}" "$@"
+}
+
+if unshare -Urn sh -c 'ip link add veth0 type veth peer name veth1' 2>/dev/null; then
+	remote "TCP, other host" "" 198.51.100.2/18000 "198.51.100.2 18000"
+	remote "TCP, no route to other host resets connection" "" 203.0.113.1/18000 "" \
+		"cannot connect to 203.0.113.1:18000: Network is unreachable" \
+		"ConnectionResetError"
+else
+	echo "SKIP TCP, other host (no veth interfaces)"
 fi
 
 # socat's listen backlog is 5: exercises connect() retries

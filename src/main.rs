@@ -255,14 +255,6 @@ fn peer(target: &Target, conn: &Conn) -> std::io::Result<Peer> {
 }
 
 fn run(cfg: Config) -> Result<u8, String> {
-    // Only addresses of host interfaces are allowed as targets, for now
-    for f in &cfg.forwards {
-        if let Target::Tcp { addr: Some(addr), .. } = f.target {
-            sys::check_local_addr(addr)
-                .map_err(|e| format!("{addr} isn't an address of a host interface: {e}"))?;
-        }
-    }
-
     let (nofile_orig, nofile) = sys::raise_nofile()
         .map_err(|e| format!("cannot get file descriptor limit: {e}"))?;
 
