@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "GPL-2.0-or-later"
-description = "Splice TCP connections from a loopback-only network namespace to host Unix domain sockets"
+description = "Forward TCP (spliced) and UDP ports from a loopback-only network namespace to the host"
 
 [dependencies]
 libc = "0.2"

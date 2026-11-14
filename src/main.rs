@@ -5,7 +5,8 @@
 //! A narrow-scoped mirror of pasta (from passt): run a command in new user and
 //! network namespaces where only the loopback interface exists, and forward
 //! selected TCP ports in there to TCP ports or Unix domain sockets on the
-//! host, moving data with splice() only.
+//! host, moving data with splice() only, and selected UDP ports to UDP ports
+//! on the host.
 
 mod config;
 mod epoll;
@@ -14,22 +15,26 @@ mod log;
 mod sandbox;
 mod splice;
 mod sys;
+mod udp;
 
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use config::{Config, Forward, Target};
+use config::{Config, Proto, Target};
 use epoll::{Epoll, Ref};
 use log::{debug, info};
 use sandbox::{Listener, Sandbox};
 use splice::{Conn, Peer, PipePool};
+use udp::Udp;
 
-/// Descriptors reserved for things other than connections
+/// Descriptors reserved for things other than connections and flows
 const RESERVED_FDS: usize = 64;
-/// Descriptors used per connection: two sockets, two pipes
+/// Descriptors used per TCP connection: two sockets, two pipes
 const FDS_PER_CONN: usize = 6;
+/// Descriptors used per UDP flow: one socket
+const FDS_PER_FLOW: usize = 1;
 /// Maximum epoll events handled per batch
 const EPOLL_EVENTS: usize = 128;
 /// Retry interval for accepting connections while paused
@@ -68,39 +73,77 @@ struct Forwarder {
     /// Connections waiting to retry connect()
     retries: Vec<Retry>,
     nconns: usize,
-    max_conns: usize,
-    /// Listening sockets were removed from epoll, see pause()
+    udp: Udp,
+    /// Descriptors available for connections and flows
+    fd_budget: usize,
+    /// TCP listening sockets were removed from epoll, see pause()
     paused: bool,
 }
 
+/// Whether @fds more descriptors fit in @budget, with TCP connections and
+/// UDP flows using @nconns and @nflows: at least one of either is allowed
+fn fds_left(budget: usize, nconns: usize, nflows: usize, fds: usize) -> bool {
+    let used = nconns * FDS_PER_CONN + nflows * FDS_PER_FLOW;
+    used == 0 || used + fds <= budget
+}
+
 impl Forwarder {
+    fn tcp_listeners(&self) -> impl Iterator<Item = (usize, &Listener)> {
+        self.listeners.iter().enumerate().filter(|(_, l)| l.proto == Proto::Tcp)
+    }
+
+    fn conn_fits(&self) -> bool {
+        fds_left(self.fd_budget, self.nconns, self.udp.nflows(), FDS_PER_CONN)
+    }
+
     /// Stop accepting connections until resources are available again
     fn pause(&mut self) {
         if self.paused {
             return;
         }
-        debug!("pausing new connections ({} active)", self.nconns);
-        for (i, l) in self.listeners.iter().enumerate() {
+        debug!("pausing new connections ({} active, {} UDP flows)", self.nconns,
+               self.udp.nflows());
+        for (i, l) in self.tcp_listeners() {
             let _ = self.ep.modify(l.fd.as_raw_fd(), 0, Ref::Listener(i));
         }
         self.paused = true;
     }
 
     fn resume(&mut self) {
-        if !self.paused || self.nconns >= self.max_conns {
+        if !self.paused || !self.conn_fits() {
             return;
         }
         debug!("resuming new connections");
-        for (i, l) in self.listeners.iter().enumerate() {
+        for (i, l) in self.tcp_listeners() {
             let _ = self.ep.modify(l.fd.as_raw_fd(), libc::EPOLLIN as u32, Ref::Listener(i));
         }
         self.paused = false;
     }
 
+    /// Handle an event on listener @li
+    fn listener_event(&mut self, li: usize) {
+        let l = &self.listeners[li];
+        match l.proto {
+            Proto::Tcp => self.accept(li),
+            Proto::Udp => {
+                let (budget, nconns) = (self.fd_budget, self.nconns);
+                self.udp.recv_ns(&self.ep, li, l.fd.as_raw_fd(), l.addr.port(), &self.targets[li],
+                                 |nflows| fds_left(budget, nconns, nflows, FDS_PER_FLOW));
+            }
+        }
+    }
+
+    /// Handle replies for UDP flow @id
+    fn flow_event(&mut self, id: usize) {
+        let Some(li) = self.udp.listener(id) else { return };
+        let l = &self.listeners[li];
+        self.udp.recv_host(id, l.fd.as_raw_fd(), l.addr.is_ipv6());
+    }
+
     /// Accept all pending connections on listener @li
     fn accept(&mut self, li: usize) {
         loop {
-            if self.nconns >= self.max_conns {
+            if !self.conn_fits() {
                 return self.pause();
             }
 
@@ -231,7 +274,7 @@ impl Forwarder {
             .map(|r| r.next.saturating_duration_since(now).as_micros().div_ceil(1000) as i32)
             .min();
         let pause = self.paused.then_some(PAUSE_RETRY_MS);
-        retry.into_iter().chain(pause).min().unwrap_or(-1)
+        retry.into_iter().chain(pause).chain(self.udp.timeout()).min().unwrap_or(-1)
     }
 
     fn conn_event(&mut self, id: usize, sidei: usize, events: u32) {
@@ -295,8 +338,10 @@ fn peer(target: &Target, conn: &Conn) -> std::io::Result<Option<Peer>> {
 fn run(mut cfg: Config) -> Result<u8, String> {
     cfg.resolve()?;
 
-    // One listening socket in the namespace per forwarded port
-    let (ports, targets): (Vec<_>, Vec<_>) = cfg.forwards.iter().flat_map(Forward::ports).unzip();
+    // One socket in the namespace per forwarded port
+    let (ports, targets): (Vec<_>, Vec<_>) = cfg.forwards.iter()
+        .flat_map(|f| f.ports().map(move |(port, target)| ((f.proto, port), target)))
+        .unzip();
 
     let (nofile_orig, nofile) = sys::raise_nofile()
         .map_err(|e| format!("cannot get file descriptor limit: {e}"))?;
@@ -342,8 +387,9 @@ fn run(mut cfg: Config) -> Result<u8, String> {
         }
     }
 
-    let max_conns = (nofile.saturating_sub(RESERVED_FDS + listeners.len()) / FDS_PER_CONN).max(1);
-    debug!("maximum {max_conns} connections");
+    let fd_budget = nofile.saturating_sub(RESERVED_FDS + listeners.len());
+    debug!("maximum {} TCP connections, or {} UDP flows", (fd_budget / FDS_PER_CONN).max(1),
+           (fd_budget / FDS_PER_FLOW).max(1));
 
     let mut fwd = Forwarder {
         ep,
@@ -355,7 +401,8 @@ fn run(mut cfg: Config) -> Result<u8, String> {
         defer: Vec::new(),
         retries: Vec::new(),
         nconns: 0,
-        max_conns,
+        udp: Udp::new(),
+        fd_budget,
         paused: false,
     };
 
@@ -374,12 +421,14 @@ fn run(mut cfg: Config) -> Result<u8, String> {
                     debug!("command exited with status {code}");
                     return Ok(code as u8);
                 }
-                Ref::Listener(i) => fwd.accept(i),
+                Ref::Listener(i) => fwd.listener_event(i),
                 Ref::Conn(id, sidei) => fwd.conn_event(id, sidei, ev),
+                Ref::Flow(id) => fwd.flow_event(id),
             }
         }
 
         fwd.retry_connect();
+        fwd.udp.expire(&fwd.ep);
         fwd.deferred();
     }
 }

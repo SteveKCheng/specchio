@@ -28,6 +28,8 @@ python3 "${TESTS}/bulk_server.py" "${TMP}/bulk.sock" 50000000 & PIDS="${PIDS} $!
 python3 "${TESTS}/bulk_server.py" tcp:127.0.0.1:18500 50000000 & PIDS="${PIDS} $!"
 python3 "${TESTS}/tcp_server.py" 0.0.0.0:18000 [::]:18000 0.0.0.0:19000 [::]:19000 \
 	>/dev/null & PIDS="${PIDS} $!"
+python3 "${TESTS}/udp_server.py" 127.0.0.1:18000 127.0.0.5:18000 [::1]:18000 \
+	127.0.0.1:19000 [::1]:19000 127.0.0.1:19001 >/dev/null & PIDS="${PIDS} $!"
 sleep 0.5
 
 # Connect to ADDR PORT in the sandbox, check echo and host address reached
@@ -69,16 +71,54 @@ check "TCP, range with exclusion" tcp "127.0.0.1 18000" 127.0.0.1 18000 \
 	-T 17990-18010,~18005,~17995-17999
 check "TCP, excluded port not forwarded" sh -c "'${B}' -T 17990-18010,~18005 -- \
 	python3 '${TESTS}/tcp_client.py' 127.0.0.1 18005 2>&1 | grep -q ConnectionRefusedError"
-check "exclusions only rejected" sh -c "! '${B}' -T ~80 -- true 2>'${TMP}/err' &&
+check "exclusions only rejected" sh -c "! '${B}' -U ~80 -- true 2>'${TMP}/err' &&
 	grep -q 'by design' '${TMP}/err'"
 check "overlapping ports rejected" sh -c "! '${B}' -T 80-90 -T 85 -- true 2>'${TMP}/err' &&
-	grep -q 'port 85 forwarded twice' '${TMP}/err'"
+	grep -q 'TCP port 85 forwarded twice' '${TMP}/err'"
 
 # More than the maximum number of descriptors per SCM_RIGHTS message (253)
-check "2999 ports" "${B}" -T 10000-12999:15001-18000,~11000 -- sh -c "
-	test \$(tail -n +2 /proc/net/tcp6 | wc -l) -eq 2999 &&
+check "3000 TCP and 2999 UDP ports" "${B}" -T 10000-12999:15001-18000 \
+	-U 10000-12999,~11000 -- sh -c "
+	test \$(tail -n +2 /proc/net/tcp6 | wc -l) -eq 3000 &&
+	test \$(tail -n +2 /proc/net/udp6 | wc -l) -eq 2999 &&
 	python3 '${TESTS}/tcp_client.py' 127.0.0.1 12999 | grep -qx '127.0.0.1 18000' &&
 	! python3 '${TESTS}/tcp_client.py' 127.0.0.1 13000 2>/dev/null"
+
+# Send datagrams to ADDR PORT in the sandbox, check replies and host address
+udp() {
+	expect="$1"; addr="$2"; port="$3"; shift 3
+	out="$("${B}" "$@" -- python3 "${TESTS}/udp_client.py" "${addr}" "${port}" 2>&1)"
+	[ "${out}" = "${expect}" ] || { echo "got: ${out}"; return 1; }
+}
+
+check "UDP, same loopback address" udp "127.0.0.5 18000" 127.0.0.5 18000 -U 18000
+check "UDP, IPv6 loopback" udp "::1 18000" ::1 18000 -U 18000
+check "UDP, other port" udp "127.0.0.1 19000" 127.0.0.1 18000 -U 18000:19000
+check "UDP, target address" udp "::1 18000" 127.0.0.1 18000 -U 18000:::1
+check "UDP, target address and port" udp "127.0.0.1 19000" ::1 53 -U 53:127.0.0.1/19000
+check "UDP, host name" sh -c "'${B}' -U 53:localhost/19000 -- \
+	python3 '${TESTS}/udp_client.py' 127.0.0.1 53 | grep -Eqx '(127.0.0.1|::1) 19000'"
+check "UDP, list and range" udp "127.0.0.1 19001" 127.0.0.1 5001 -U 80,5000-5001:19000-19001
+check "UDP, with TCP on the same port" sh -c "'${B}' -T 18000 -U 18000:19000 -- sh -c \
+	\"python3 '${TESTS}/tcp_client.py' 127.0.0.1 18000 &&
+	  python3 '${TESTS}/udp_client.py' 127.0.0.1 18000\" |
+	tr '\n' ' ' | grep -qx '127.0.0.1 18000 127.0.0.1 19000 '"
+check "UDP, 200 datagrams of 60000 bytes, IPv4" sh -c "'${B}' -U 18000:19000 -- \
+	python3 '${TESTS}/udp_client.py' 127.0.0.1 18000 200 60000 | grep -qx '127.0.0.1 19000'"
+check "UDP, 200 datagrams of 65000 bytes, IPv6" sh -c "'${B}' -U 18000:19000 -- \
+	python3 '${TESTS}/udp_client.py' ::1 18000 200 65000 | grep -qx '::1 19000'"
+check "UDP, 100 concurrent flows" "${B}" -U 18000 -- python3 -c '
+import socket
+ss = [socket.socket(socket.AF_INET, socket.SOCK_DGRAM) for i in range(100)]
+for i, s in enumerate(ss):
+    s.bind(("", 0)); s.settimeout(5); s.sendto(str(i).encode(), ("127.0.0.1", 18000))
+for i, s in enumerate(ss):
+    assert s.recv(100) == f"127.0.0.1 18000\n{i}".encode()'
+check "UDP, refused port: no reply, specchio carries on" sh -c "'${B}' -d -U 18001 -U 18000 -- \
+	sh -c \"! python3 '${TESTS}/udp_client.py' 127.0.0.1 18001 2>/dev/null &&
+	  python3 '${TESTS}/udp_client.py' 127.0.0.1 18000\" 2>'${TMP}/err' | grep -qx '127.0.0.1 18000' &&
+	grep -q 'UDP flow 0: Connection refused' '${TMP}/err'"
+check "UDP, Unix domain socket target rejected" sh -c "! '${B}' -U 53:/run/dns.sock -- true"
 
 check "TCP, refused port resets connection" sh -c "'${B}' -T 18000:20000 -- \
 	python3 '${TESTS}/tcp_client.py' 127.0.0.1 18000 2>&1 | grep -q ConnectionResetError"
@@ -116,6 +156,10 @@ remote() {
 	name="$1"; shift
 	check "${name}" unshare -Urnm sh "${TESTS}/remote.sh" "${B}" "${TMP}" "$@"
 }
+remote_udp() {
+	name="$1"; shift
+	check "${name}" env PROTO=udp unshare -Urnm sh "${TESTS}/remote.sh" "${B}" "${TMP}" "$@"
+}
 
 if unshare -Urn sh -c 'ip link add veth0 type veth peer name veth1' 2>/dev/null; then
 	remote "TCP, other host" "" 198.51.100.2/18000 "198.51.100.2 18000"
@@ -128,6 +172,10 @@ if unshare -Urn sh -c 'ip link add veth0 type veth peer name veth1' 2>/dev/null;
 	remote "TCP, no route to other host resets connection" "" 203.0.113.1/18000 "" \
 		"cannot connect to 203.0.113.1:18000: Network is unreachable" \
 		"ConnectionResetError"
+	remote_udp "UDP, other host by name" "198.51.100.2 remote.test\\n" \
+		remote.test/18000 "198.51.100.2 18000" "UDP flow 0: .* -> 198.51.100.2:18000 on host"
+	remote_udp "UDP, no route to other host" "" 203.0.113.1/18000 "" \
+		"cannot connect to 203.0.113.1:18000: Network is unreachable" "TimeoutError"
 else
 	echo "SKIP TCP, other host (no veth interfaces)"
 fi
@@ -167,7 +215,7 @@ check "reader sees EOF when command closes standard output" sh -c "
 
 check "exit status passed through" sh -c "'${B}' -- sh -c 'exit 7'; test \$? -eq 7"
 
-check "no descriptors leaked to command" sh -c "'${B}' -T 8000:'${TMP}/echo.sock' -- \
+check "no descriptors leaked to command" sh -c "'${B}' -T 8000:'${TMP}/echo.sock' -U 53 -- \
 	sh -c 'ls /proc/self/fd' | sort -n | tr '\n' ' ' | grep -qx '0 1 2 3 '"
 
 exit ${fail}

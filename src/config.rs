@@ -13,8 +13,8 @@ pub const USAGE: &str = "\
 Usage: specchio [OPTION]... [--] [COMMAND [ARG]...]
 
 Run COMMAND (default: $SHELL) in new user and network namespaces with only a
-loopback interface, splicing TCP connections to forwarded ports in the
-namespace to TCP ports or Unix domain sockets on the host.
+loopback interface, forwarding TCP connections and UDP datagrams to chosen
+ports in the namespace to ports or Unix domain sockets on the host.
 
 Options:
   -T, --tcp-ns SPEC   Forward TCP ports from the namespace to the host, as
@@ -39,10 +39,13 @@ Options:
                                       PORTS
                       TOPORTS is a port, or a range of the same length as
                       PORTS.  Can be given multiple times
+  -U, --udp-ns SPEC   Forward UDP ports from the namespace to the host, as
+                      with pasta(1).  SPEC as for -T, except that Unix domain
+                      socket targets aren't supported
   -t, --tcp-ports none
   -u, --udp-ports none
-  -U, --udp-ns none   Accepted for compatibility with pasta(1): no inbound
-                      or UDP forwarding is supported yet
+                      Accepted for compatibility with pasta(1): no inbound
+                      forwarding is supported yet
   -d, --debug         Print debugging messages
   -h, --help          Display this help message and exit
       --version       Show version and exit
@@ -52,7 +55,7 @@ Examples:
       env https_proxy=http://127.0.0.1:3128 curl https://example.com/
   specchio -T 8080,8443 -T 5432:192.0.2.1/5433 -- my-agent
   specchio -T 2222:build.lan/22 -- ssh -p 2222 127.0.0.1
-  specchio -T 8000-8099,~8080 -- my-agent
+  specchio -T 8000-8099,~8080 -U 53:127.0.0.53 -- my-agent
 ";
 
 /// Host side Unix domain socket to connect to
@@ -118,12 +121,35 @@ impl fmt::Display for UnixTarget {
     }
 }
 
+/// Transport protocol of a forward
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Proto {
+    Tcp,
+    Udp,
+}
+
+impl Proto {
+    pub fn name(self) -> &'static str {
+        match self {
+            Proto::Tcp => "TCP",
+            Proto::Udp => "UDP",
+        }
+    }
+
+    fn opt(self) -> &'static str {
+        match self {
+            Proto::Tcp => "-T",
+            Proto::Udp => "-U",
+        }
+    }
+}
+
 /// Where to connect to on the host
 #[derive(Clone, Debug)]
 pub enum Target {
-    /// TCP port, at @addr, or at the address connected to in the namespace
+    /// IP port, at @addr, or at the address connected to in the namespace
     Ip { addr: Option<IpAddr>, port: u16 },
-    /// TCP port on host @name, with @addrs filled in by Config::resolve()
+    /// Port on host @name, with @addrs filled in by Config::resolve()
     Host { name: String, port: u16, addrs: Vec<SocketAddr> },
     Unix(UnixTarget),
 }
@@ -164,6 +190,7 @@ impl fmt::Display for Target {
 /// One forwarding rule: a range of ports in the namespace, and its target
 #[derive(Clone, Debug)]
 pub struct Forward {
+    pub proto: Proto,
     /// Ports to listen on in the namespace, on any loopback address
     pub first: u16,
     pub last: u16,
@@ -182,9 +209,9 @@ impl fmt::Display for Forward {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let n = self.last - self.first;
         if n == 0 {
-            write!(f, "port {}", self.first)?;
+            write!(f, "{} port {}", self.proto.name(), self.first)?;
         } else {
-            write!(f, "ports {}-{}", self.first, self.last)?;
+            write!(f, "{} ports {}-{}", self.proto.name(), self.first, self.last)?;
         }
         write!(f, " to {}", self.target.describe(n))
     }
@@ -264,7 +291,7 @@ fn wildcard(spec: &[u8]) -> Option<String> {
 /// Parse an included chunk of a port specifier: FIRST[-LAST][:TARGET]
 ///
 /// Return: (first, last, target for first port), or an error message
-fn parse_chunk(chunk: &[u8]) -> Result<(u16, u16, Target), String> {
+fn parse_chunk(proto: Proto, chunk: &[u8]) -> Result<(u16, u16, Target), String> {
     let (ports, target) = match chunk.iter().position(|&b| b == b':') {
         Some(colon) => (&chunk[..colon], Some(&chunk[colon + 1..])),
         None => (chunk, None),
@@ -273,7 +300,7 @@ fn parse_chunk(chunk: &[u8]) -> Result<(u16, u16, Target), String> {
     let Some((first, last)) = parse_range(ports) else {
         // pasta's error for [ADDRESS[%IFNAME]/]PORT with -T, otherwise a guess
         if ports.contains(&b'/') || ports.contains(&b'%') || parse_ip(ports).is_some() {
-            return Err("listening address not allowed for -T".into());
+            return Err(format!("listening address not allowed for {}", proto.opt()));
         }
         return Err("bad port or port range".into());
     };
@@ -290,6 +317,9 @@ fn parse_chunk(chunk: &[u8]) -> Result<(u16, u16, Target), String> {
         None => Target::Ip { addr: None, port: first },
         Some([]) => return Err("empty target".into()),
         Some(t @ ([b'/' | b'@', ..] | [b'.', b'/', ..] | [b'.', b'.', b'/', ..])) => {
+            if proto == Proto::Udp {
+                return Err("Unix domain socket targets aren't supported for UDP".into());
+            }
             Target::Unix(UnixTarget::parse(t)?)
         }
         Some(t) => {
@@ -315,12 +345,12 @@ fn parse_chunk(chunk: &[u8]) -> Result<(u16, u16, Target), String> {
     Ok((first, last, target))
 }
 
-/// Parse a forwarding specification for -T, see USAGE: a
+/// Parse a forwarding specification for -T or -U, see USAGE: a
 /// comma-separated list of ports or port ranges with targets, and of excluded
 /// ports or port ranges (~FIRST[-LAST]), which apply to the whole list
 ///
 /// Return: None for "none", forwarding rules otherwise
-fn parse_forwards(spec: &[u8]) -> Result<Option<Vec<Forward>>, String> {
+fn parse_forwards(proto: Proto, spec: &[u8]) -> Result<Option<Vec<Forward>>, String> {
     let bad = |why: &str| format!("invalid port specifier '{}': {why}",
                                   String::from_utf8_lossy(spec));
 
@@ -338,7 +368,7 @@ fn parse_forwards(spec: &[u8]) -> Result<Option<Vec<Forward>>, String> {
             [b'~', range @ ..] => {
                 excluded.push(parse_range(range).ok_or_else(|| bad("bad excluded port range"))?);
             }
-            _ => included.push(parse_chunk(chunk).map_err(|e| bad(&e))?),
+            _ => included.push(parse_chunk(proto, chunk).map_err(|e| bad(&e))?),
         }
     }
     if included.is_empty() {
@@ -361,7 +391,7 @@ fn parse_forwards(spec: &[u8]) -> Result<Option<Vec<Forward>>, String> {
             while port < u32::from(last) && !is_excluded(port as u16 + 1) {
                 port += 1;
             }
-            forwards.push(Forward { first: base, last: port as u16,
+            forwards.push(Forward { proto, first: base, last: port as u16,
                                     target: target.shifted(base - first) });
             port += 1;
         }
@@ -370,21 +400,23 @@ fn parse_forwards(spec: &[u8]) -> Result<Option<Vec<Forward>>, String> {
     Ok(Some(forwards))
 }
 
-/// Handle one --tcp-ns option
-fn tcp_ns(cfg: &mut Config, spec: &[u8]) -> Result<(), String> {
-    match parse_forwards(spec)? {
+/// Handle one --tcp-ns or --udp-ns option
+fn add_forwards(cfg: &mut Config, proto: Proto, spec: &[u8]) -> Result<(), String> {
+    match parse_forwards(proto, spec)? {
         // As in pasta, "none" only conflicts with rules given before it
-        None if !cfg.forwards.is_empty() => {
-            return Err("-T none conflicts with previous options".into());
+        None if cfg.forwards.iter().any(|f| f.proto == proto) => {
+            return Err(format!("{} none conflicts with previous options", proto.opt()));
         }
         None => {}
         Some(forwards) => {
             for f in forwards {
-                let prev = cfg.forwards.iter().find(|p| p.first <= f.last && f.first <= p.last);
+                let prev = cfg.forwards.iter()
+                    .find(|p| p.proto == proto && p.first <= f.last && f.first <= p.last);
                 if let Some(prev) = prev {
                     let port = f.first.max(prev.first);
-                    return Err(format!("port {port} forwarded twice: to {} and to {}",
-                                       prev.target.describe(0), f.target.describe(0)));
+                    return Err(format!("{} port {port} forwarded twice: to {} and to {}",
+                                       proto.name(), prev.target.describe(0),
+                                       f.target.describe(0)));
                 }
                 cfg.forwards.push(f);
             }
@@ -466,8 +498,9 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Config>,
             }
             b"-d" | b"--debug" => cfg.debug = true,
             _ if let Some(r) = port_opt(a, &mut args) => match r? {
-                (PortOpt::TcpNs, spec) => tcp_ns(&mut cfg, &spec)?,
-                // No-ops for now, only "none" is accepted
+                (PortOpt::TcpNs, spec) => add_forwards(&mut cfg, Proto::Tcp, &spec)?,
+                (PortOpt::UdpNs, spec) => add_forwards(&mut cfg, Proto::Udp, &spec)?,
+                // Inbound forwarding: no-ops for now, only "none" is accepted
                 (_, spec) if spec == b"none" => {}
                 (opt, spec) => {
                     let why = wildcard(&spec).unwrap_or_else(|| "not supported yet".into());
@@ -545,7 +578,7 @@ mod tests {
     use super::*;
 
     fn fwds(spec: &str) -> Vec<Forward> {
-        parse_forwards(spec.as_bytes()).unwrap().unwrap()
+        parse_forwards(Proto::Tcp, spec.as_bytes()).unwrap().unwrap()
     }
 
     fn fwd(spec: &str) -> Forward {
@@ -577,7 +610,7 @@ mod tests {
 
     #[test]
     fn pasta_syntax() {
-        assert!(parse_forwards(b"none").unwrap().is_none());
+        assert!(parse_forwards(Proto::Tcp, b"none").unwrap().is_none());
         assert_eq!(ip("8080"), (8080, None, 8080));
         assert_eq!(ip("8080:9090"), (8080, None, 9090));
         assert_eq!(ip("8080:192.0.2.1"), (8080, a("192.0.2.1"), 8080));
@@ -616,7 +649,7 @@ mod tests {
                                   addrs: vec!["[::1]:9000".parse().unwrap()] };
         let Some((8001, Target::Host { port: 9001, addrs, .. })) = f.ports().nth(1) else { panic!() };
         assert_eq!(addrs, ["[::1]:9001".parse().unwrap()]);
-        assert_eq!(f.to_string(), "ports 8000-8001 to a.lan:9000-9001");
+        assert_eq!(f.to_string(), "TCP ports 8000-8001 to a.lan:9000-9001");
     }
 
     #[test]
@@ -634,7 +667,7 @@ mod tests {
         assert_eq!(host("22:x"), (22, "x".into(), 22));
         assert_eq!(host("22:proxy.sock"), (22, "proxy.sock".into(), 22));
         assert_eq!(host("22:_srv.a-b.1x/23"), (22, "_srv.a-b.1x".into(), 23));
-        assert!(parse_forwards(format!("1:{}.a", "x".repeat(64)).as_bytes()).is_err());
+        assert!(parse_forwards(Proto::Tcp, format!("1:{}.a", "x".repeat(64)).as_bytes()).is_err());
     }
 
     #[test]
@@ -662,6 +695,7 @@ mod tests {
         // Commas separate list items, also after a socket path
         let f = fwds("3128:/run/a,8080:/run/b");
         assert!(matches!(f[1].target, Target::Unix(UnixTarget::Path(ref p)) if p == "/run/b"));
+        assert!(parse_forwards(Proto::Udp, b"53:/run/dns.sock").is_err());
     }
 
     #[test]
@@ -674,11 +708,11 @@ mod tests {
                      "80,", ",80", "80,,81", "90-80", "0-10", "80-", "-80", "80-90-100",
                      "~80", "~80,~90", "~", "~x", "80,~", "8000-8010:9000", "8000-8010:9000-9011",
                      "8000:9000-9001", "8000-8010:::1/9000", "80:/run/a,b", "65535:65534-65535"] {
-            assert!(parse_forwards(spec.as_bytes()).is_err(),
+            assert!(parse_forwards(Proto::Tcp, spec.as_bytes()).is_err(),
                     "'{spec}' should be invalid");
         }
         let long = format!("1:/{}", "x".repeat(200));
-        assert!(parse_forwards(long.as_bytes()).is_err());
+        assert!(parse_forwards(Proto::Tcp, long.as_bytes()).is_err());
     }
 
     #[test]
@@ -695,6 +729,18 @@ mod tests {
         assert!(args(&["-T", "80,80"]).is_err());
         assert!(args(&["-T", "80-90,85"]).is_err());
         assert!(args(&["-T"]).is_err());
+
+        // TCP and UDP rules are separate
+        let cfg = args(&["-T", "53", "-U", "53", "-U", "123,500-501", "-T", "none"]);
+        assert!(cfg.is_err(), "-T none after -T");
+        let cfg = args(&["-T", "53", "-U", "53", "-U", "123,500-501", "true"]).unwrap().unwrap();
+        let udp: Vec<_> = cfg.forwards.iter().filter(|f| f.proto == Proto::Udp)
+            .map(|f| (f.first, f.last)).collect();
+        assert_eq!(udp, [(53, 53), (123, 123), (500, 501)]);
+        assert!(args(&["-U", "53", "-U", "53"]).is_err());
+        assert!(args(&["-U", "none", "-U", "53", "-T", "none", "true"]).is_ok());
+        assert!(args(&["-U", "53", "-U", "none"]).is_err());
+        assert!(args(&["-U", "53", "--udp-ns=none"]).is_err());
     }
 
     #[test]
@@ -709,7 +755,7 @@ mod tests {
         let cfg = args(&["-t", "none", "-T", "8080", "-U", "none", "true"]).unwrap().unwrap();
         assert_eq!(cfg.forwards.len(), 1);
 
-        for bad in [&["-t", "80"][..], &["-u", "53"], &["--udp-ns=53"], &["-U"], &["--tcp-ports"],
+        for bad in [&["-t", "80"][..], &["-u", "53"], &["-U"], &["--tcp-ports"],
                     &["--tcp-portsnone"]] {
             assert!(args(bad).is_err(), "{bad:?} should be invalid");
         }
@@ -724,7 +770,9 @@ mod tests {
                 assert!(e.contains("by design"), "{opt} {spec}: {e}");
             }
         }
-        let e = parse(["-T", "~80"].iter().map(OsString::from)).unwrap_err();
-        assert!(e.contains("by design"), "-T ~80: {e}");
+        for opt in ["-T", "-U"] {
+            let e = parse([opt, "~80"].iter().map(OsString::from)).unwrap_err();
+            assert!(e.contains("by design"), "{opt} ~80: {e}");
+        }
     }
 }

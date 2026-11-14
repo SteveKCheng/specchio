@@ -11,7 +11,8 @@
 //!    GID to root, so that the child gets CAP_NET_ADMIN over the new network
 //!    namespace
 //! 2. bring up the loopback interface
-//! 3. create the listening sockets for all forwarded ports
+//! 3. create the listening sockets (TCP) and receiving sockets (UDP) for all
+//!    forwarded ports
 //! 4. send them to the parent with SCM_RIGHTS over a socketpair, in batches
 //! 5. close everything and exec() the command
 //!
@@ -24,6 +25,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 
+use crate::config::Proto;
 use crate::fdpass;
 use crate::sys::{self, cvt};
 
@@ -31,10 +33,11 @@ use crate::sys::{self, cvt};
 const MSG_OK: u8 = b'K';
 const MSG_ERR: u8 = b'E';
 
-/// Listening socket inside the sandbox
+/// Listening (TCP) or receiving (UDP) socket inside the sandbox
 pub struct Listener {
     pub fd: OwnedFd,
     pub addr: SocketAddr,
+    pub proto: Proto,
 }
 
 pub struct Sandbox {
@@ -43,11 +46,10 @@ pub struct Sandbox {
     pub listeners: Vec<Listener>,
 }
 
-/// Start @command in a new sandbox, with a listening socket for each of @ports,
-/// in order
+/// Start @command in a new sandbox, with a socket for each of @ports, in order
 ///
 /// @nofile is the original RLIMIT_NOFILE, restored for the command
-pub fn spawn(command: &[OsString], ports: &[u16], nofile: &libc::rlimit)
+pub fn spawn(command: &[OsString], ports: &[(Proto, u16)], nofile: &libc::rlimit)
              -> io::Result<Sandbox> {
     // Prepare everything that allocates before fork()
     let argv: Vec<CString> = command.iter()
@@ -88,10 +90,10 @@ pub fn spawn(command: &[OsString], ports: &[u16], nofile: &libc::rlimit)
             return Err(e);
         }
     };
-    let listeners = fds.into_iter()
-        .map(|fd| {
+    let listeners = fds.into_iter().zip(ports)
+        .map(|(fd, &(proto, _))| {
             let addr = sys::local_addr(fd.as_raw_fd())?;
-            Ok(Listener { fd, addr })
+            Ok(Listener { fd, addr, proto })
         })
         .collect::<io::Result<_>>()?;
 
@@ -156,7 +158,7 @@ pub fn reap(pid: libc::pid_t) -> i32 {
 
 /// Body of the child process: set up the sandbox, report back, exec()
 fn child(sock: OwnedFd, uid: libc::uid_t, gid: libc::gid_t, ppid: libc::pid_t,
-         ports: &[u16], nofile: &libc::rlimit,
+         ports: &[(Proto, u16)], nofile: &libc::rlimit,
          argv: &[*const libc::c_char]) -> ! {
     match child_setup(uid, gid, ppid, ports) {
         Ok(fds) => {
@@ -201,7 +203,7 @@ fn child(sock: OwnedFd, uid: libc::uid_t, gid: libc::gid_t, ppid: libc::pid_t,
 ///
 /// Return: sockets for the parent, or error string
 fn child_setup(uid: libc::uid_t, gid: libc::gid_t, ppid: libc::pid_t,
-               ports: &[u16]) -> Result<Vec<OwnedFd>, String> {
+               ports: &[(Proto, u16)]) -> Result<Vec<OwnedFd>, String> {
     // SAFETY: unshare() has no memory safety preconditions
     cvt(unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) })
         .map_err(|e| format!("cannot create namespaces: {e}"))?;
@@ -231,8 +233,9 @@ fn child_setup(uid: libc::uid_t, gid: libc::gid_t, ppid: libc::pid_t,
     loopback_up().map_err(|e| format!("cannot bring up loopback interface: {e}"))?;
 
     ports.iter()
-        .map(|&port| listen(port)
-             .map_err(|e| format!("cannot listen on port {port} in namespace: {e}")))
+        .map(|&(proto, port)| listen(proto, port).map_err(|e| {
+            format!("cannot listen on {} port {port} in namespace: {e}", proto.name())
+        }))
         .collect()
 }
 
@@ -257,24 +260,39 @@ fn loopback_up() -> io::Result<()> {
     Ok(())
 }
 
-/// Create a non-blocking TCP socket listening on @port, on the loopback
-/// interface, dual-stack if IPv6 is available, like pasta does for -T
-fn listen(port: u16) -> io::Result<OwnedFd> {
-    match listen_on(&SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port)) {
+/// Create a non-blocking socket listening (TCP) or receiving (UDP) on @port,
+/// on the loopback interface, dual-stack if IPv6 is available, like pasta
+/// does for -T and -U
+fn listen(proto: Proto, port: u16) -> io::Result<OwnedFd> {
+    match listen_on(proto, &SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port)) {
         Err(e) if matches!(e.raw_os_error(), Some(libc::EAFNOSUPPORT | libc::EADDRNOTAVAIL)) => {
-            listen_on(&SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port))
+            listen_on(proto, &SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port))
         }
         r => r,
     }
 }
 
-fn listen_on(addr: &SocketAddr) -> io::Result<OwnedFd> {
+fn listen_on(proto: Proto, addr: &SocketAddr) -> io::Result<OwnedFd> {
     let af = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
-    let s = sys::socket(af, libc::SOCK_STREAM | libc::SOCK_NONBLOCK)?;
+    let ty = match proto {
+        Proto::Tcp => libc::SOCK_STREAM,
+        Proto::Udp => libc::SOCK_DGRAM,
+    };
+    let s = sys::socket(af, ty | libc::SOCK_NONBLOCK)?;
+    let fd = s.as_raw_fd();
 
-    sys::setsockopt_int(s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_REUSEADDR, 1)?;
+    match proto {
+        Proto::Tcp => sys::setsockopt_int(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, 1)?,
+        // Not SO_REUSEADDR: the command could bind the same port with it, and
+        // take datagrams from us.  We need the destination address of
+        // datagrams, to reply from it (see udp.rs)
+        Proto::Udp if addr.is_ipv6() => {
+            sys::setsockopt_int(fd, libc::IPPROTO_IPV6, libc::IPV6_RECVPKTINFO, 1)?;
+        }
+        Proto::Udp => sys::setsockopt_int(fd, libc::IPPROTO_IP, libc::IP_PKTINFO, 1)?,
+    }
     if addr.is_ipv6() {
-        sys::setsockopt_int(s.as_raw_fd(), libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, 0)?;
+        sys::setsockopt_int(fd, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, 0)?;
     }
 
     // Only lo exists now, but the command could add interfaces (it has
@@ -288,7 +306,9 @@ fn listen_on(addr: &SocketAddr) -> io::Result<OwnedFd> {
     let (sa, len) = sys::sockaddr_ip(addr);
     // SAFETY: sa is a valid socket address of length len
     cvt(unsafe { libc::bind(s.as_raw_fd(), (&sa as *const libc::sockaddr_storage).cast(), len) })?;
-    // SAFETY: listen() has no memory safety preconditions
-    cvt(unsafe { libc::listen(s.as_raw_fd(), libc::SOMAXCONN) })?;
+    if proto == Proto::Tcp {
+        // SAFETY: listen() has no memory safety preconditions
+        cvt(unsafe { libc::listen(s.as_raw_fd(), libc::SOMAXCONN) })?;
+    }
     Ok(s)
 }

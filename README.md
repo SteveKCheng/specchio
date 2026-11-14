@@ -4,10 +4,11 @@
 from [passt](https://passt.top/). It runs a command in new user and network
 namespaces where only `lo` exists, and forwards chosen TCP ports inside them
 to TCP ports on the host or other hosts, or to Unix domain sockets on the
-host. Data moves only by
-`splice()`, and there is no TAP interface, no packet parsing and no `fork()`
-per connection. The goal is to cover all of `pasta`'s splicing (TCP and UDP,
-in both directions); so far, TCP from the sandbox to the host works.
+host, and chosen UDP ports to UDP ports on the host or other hosts. TCP data
+moves only by `splice()`, and there is no TAP interface, no packet parsing
+and no `fork()` per connection. The goal is to cover all of `pasta`'s
+splicing (TCP and UDP, in both directions); so far, forwarding from the
+sandbox to the host works.
 
 The intended use is sandboxing: give a sandboxed agent access to, say, an
 HTTP(S) proxy as an object capability. The agent can reach the forwarded port
@@ -37,11 +38,24 @@ This uses `pasta`'s syntax; `-T` can be repeated:
 | `-T 2222:build.lan/22` | same | `build.lan`, resolved at start-up, port 22 (`-T 22:build.lan` for port 22 to 22) |
 | `-T 3128:/run/proxy.sock` | same | Unix socket (also `./rel/path`, `../rel/path`; `@name` for abstract sockets; `8000-8010:/run/proxy.sock` for all ports of a range) |
 
-`-t`/`--tcp-ports`, `-u`/`--udp-ports` and `-U`/`--udp-ns` are accepted
-with `none` only, as no-ops, so that `pasta` command lines like
+`-t`/`--tcp-ports` and `-u`/`--udp-ports` are accepted with `none` only, as
+no-ops, so that `pasta` command lines like
 `pasta -t none -u none -U none -T 8080 -- ...` work unchanged. As in `pasta`,
 `-T none` is an error after other `-T` options, but not before them, and a
 port can't be forwarded twice.
+
+### `-U`, `--udp-ns`
+
+The same syntax as `-T`, for UDP, except that Unix domain socket targets
+aren't supported. `-U` and `-T` can forward the same port. As in `pasta`, a
+flow is a client address and port in the namespace sending to a forwarded
+port: each flow gets its own socket on the host, connected to the target, and
+replies to that socket go back to the client, from the address and port it
+sent to. A flow expires after 30 s without datagrams, or 120 s once it has
+seen more than one datagram in either direction and at least one reply
+(`pasta`'s defaults; it reads them from `nf_conntrack_udp_timeout` and
+`nf_conntrack_udp_timeout_stream`). Datagrams are copied with
+`recvmmsg()`/`sendmmsg()`, as in `pasta`: `splice()` doesn't apply to them.
 
 Compared to `pasta`:
 
@@ -51,8 +65,8 @@ Compared to `pasta`:
 
 - A list of exclusions only (`-T ~80`) means all other (non-ephemeral) ports
   in `pasta`, so it's rejected, like `all`.
-- As with `pasta`, a listening address (`ADDR/PORT`) isn't allowed for `-T`.
-  specchio listens on all addresses (dual-stack), bound to `lo` with
+- As with `pasta`, a listening address (`ADDR/PORT`) isn't allowed for `-T`
+  and `-U`. specchio listens on all addresses (dual-stack), bound to `lo` with
   `SO_BINDTODEVICE`.
 - The target address is honoured. `pasta` parses it for `-T`, but
   `fwd_nat_from_splice()` ignores it and always uses the same loopback
@@ -67,9 +81,22 @@ Compared to `pasta`:
   order `getaddrinfo()` gives (RFC 6724, `gai.conf`) until one connects.
   An address that doesn't answer at all holds a connection up until the
   kernel gives up on it (`tcp_syn_retries`, about two minutes by default);
-  there's no Happy Eyeballs. A name is dot-separated labels of letters,
+  there's no Happy Eyeballs. For UDP, a new flow uses the first address it
+  can `connect()` to, which only fails without a route: an address that
+  turns out not to answer, or to refuse datagrams (ICMP port unreachable),
+  isn't replaced by the next one. A name is dot-separated labels of letters,
   digits, `-` and `_`; one whose last label is numeric is rejected as a
   mistyped IPv4 address.
+- UDP flows aren't bound to the client's address and port on the host side:
+  the kernel picks them, as for TCP. `pasta` binds them to the same loopback
+  address and port as the client in the namespace (`fwd_nat_from_splice()`),
+  which wouldn't work for targets on other hosts, and fails if that port is in
+  use on the host. Replies to the namespace go out through the socket
+  receiving on the forwarded port, with the source address set by
+  `IP_PKTINFO`/`IPV6_PKTINFO`; `pasta` instead creates a socket per flow in
+  the namespace, which specchio can't do (see "How it works"). ICMP errors
+  from the target (such as port unreachable) aren't relayed to the client,
+  which sees no reply, as with `pasta`'s spliced flows.
 - Unix domain socket targets are a specchio extension. A target starting with
   `/`, `./`, `../` or `@` can't be a port or an address in `pasta`'s syntax.
   Without such a prefix, `proxy.sock` is a host name: if resolving it fails
@@ -89,9 +116,9 @@ status (128 + signal number if the command was killed).
 
 1. **Child (`sandbox.rs`)**: `unshare(CLONE_NEWUSER | CLONE_NEWNET)`, maps the
    original UID/GID to root (a fixed one-line map), brings `lo` up, creates a
-   listening socket for each forwarded port, and sends them to the parent with
-   `SCM_RIGHTS` over a `socketpair`, at most 253 per message. It then closes
-   them and `exec`s the command.
+   listening (TCP) or receiving (UDP) socket for each forwarded port, and sends
+   them to the parent with `SCM_RIGHTS` over a `socketpair`, at most 253 per
+   message. It then closes them and `exec`s the command.
    A socket stays in the network namespace it was created in, so the parent
    needs no capabilities and never enters the namespace (unlike `pasta`, which
    uses `setns()`). The command can't get at the listeners afterwards: they're
@@ -105,6 +132,16 @@ status (128 + signal number if the command was killed).
    and `SPLICE_F_MORE`/`TCP_NODELAY` corking). The parent waits for the command
    with a pidfd, and the child gets `PR_SET_PDEATHSIG`, so neither outlives the
    other.
+3. **UDP (`udp.rs`)**: datagrams from the namespace are read in batches with
+   `recvmmsg()`, along with their source address and their destination
+   address (`IP_PKTINFO`/`IPV6_PKTINFO`), which identify the flow (in a hash
+   table). Each flow has a host side socket, `connect()`ed to the target, and
+   polled for replies. Flows that expired are closed once per second.
+
+TCP connections (six descriptors each: two sockets and two pipes) and UDP
+flows (one socket each) share the descriptor limit. When it's reached, TCP
+listeners stop accepting connections, and datagrams of new UDP flows are
+dropped.
 
 ### Differences from `tcp_splice.c`
 
@@ -127,7 +164,6 @@ status (128 + signal number if the command was killed).
 
 ## Not yet done
 
-- **UDP** (`-U`).
 - **Inbound forwarding** (`-t`/`-u`, host port to sandbox). This needs sockets created in
   the sandbox namespace on demand, and a pool sent at startup can't be refilled
   once the child has `exec`'d. Options: keep a small helper process in the
@@ -148,6 +184,10 @@ status (128 + signal number if the command was killed).
 cargo test               # unit tests (argument parsing)
 cargo build --release && tests/run.sh   # end-to-end, needs python3 and socat
 ```
+
+`tests/udp_client.py` binds its socket explicitly before sending: with
+Python 3.14.10, `recvfrom()` on a socket bound implicitly by `sendto()`
+returns a bogus source address (family 0), even without specchio.
 
 Throughput with `dd | socat` over host loopback, 8 GB: about 4.4 GB/s for a
 direct connection, `pasta --splice-only -T` and specchio alike.

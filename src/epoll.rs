@@ -12,16 +12,19 @@ use crate::sys::cvt;
 pub enum Ref {
     /// pidfd of the sandboxed child process
     Child,
-    /// Listening socket, by index
+    /// Listening (TCP) or receiving (UDP) socket in the namespace, by index
     Listener(usize),
     /// Socket of a spliced connection, by connection index and side
     Conn(usize, usize),
+    /// Host side socket of a UDP flow, by flow index
+    Flow(usize),
 }
 
 const TAG_SHIFT: u32 = 56;
 const TAG_CHILD: u64 = 1;
 const TAG_LISTENER: u64 = 2;
 const TAG_CONN: u64 = 3;
+const TAG_FLOW: u64 = 4;
 
 impl Ref {
     fn encode(self) -> u64 {
@@ -29,6 +32,7 @@ impl Ref {
             Ref::Child => TAG_CHILD << TAG_SHIFT,
             Ref::Listener(i) => TAG_LISTENER << TAG_SHIFT | i as u64,
             Ref::Conn(i, sidei) => TAG_CONN << TAG_SHIFT | (i as u64) << 1 | sidei as u64,
+            Ref::Flow(i) => TAG_FLOW << TAG_SHIFT | i as u64,
         }
     }
 
@@ -38,6 +42,7 @@ impl Ref {
             TAG_CHILD => Ref::Child,
             TAG_LISTENER => Ref::Listener(payload as usize),
             TAG_CONN => Ref::Conn((payload >> 1) as usize, (payload & 1) as usize),
+            TAG_FLOW => Ref::Flow(payload as usize),
             _ => unreachable!("bad epoll reference {v:#x}"),
         }
     }
