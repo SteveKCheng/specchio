@@ -74,7 +74,7 @@ check "TCP, excluded port not forwarded" sh -c "'${B}' -T 17990-18010,~18005 -- 
 check "exclusions only rejected" sh -c "! '${B}' -U ~80 -- true 2>'${TMP}/err' &&
 	grep -q 'by design' '${TMP}/err'"
 check "overlapping ports rejected" sh -c "! '${B}' -T 80-90 -T 85 -- true 2>'${TMP}/err' &&
-	grep -q 'TCP port 85 forwarded twice' '${TMP}/err'"
+	grep -q 'TCP port 85 in namespace forwarded twice' '${TMP}/err'"
 
 # More than the maximum number of descriptors per SCM_RIGHTS message (253)
 check "3000 TCP and 2999 UDP ports" "${B}" -T 10000-12999:15001-18000 \

@@ -336,6 +336,9 @@ fn peer(target: &Target, conn: &Conn) -> std::io::Result<Option<Peer>> {
 
 
 fn run(mut cfg: Config) -> Result<u8, String> {
+    if cfg.forwards.iter().any(|f| f.inbound) {
+        return Err("forwarding from the host (-t, -u) isn't implemented yet".into());
+    }
     cfg.resolve()?;
 
     // One socket in the namespace per forwarded port
@@ -383,7 +386,7 @@ fn run(mut cfg: Config) -> Result<u8, String> {
     if let Some(l) = listeners.first() {
         let any = if l.addr.is_ipv6() { "[::]" } else { "0.0.0.0" };
         for f in &cfg.forwards {
-            debug!("forwarding {f}, from {any} (lo) in namespace");
+            debug!("forwarding {f}, from {any} (lo)");
         }
     }
 

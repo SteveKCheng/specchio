@@ -40,8 +40,9 @@ This uses `pasta`'s syntax; `-T` can be repeated:
 | `-T 2222:build.lan/22` | same | `build.lan`, resolved at start-up, port 22 (`-T 22:build.lan` for port 22 to 22) |
 | `-T 3128:/run/proxy.sock` | same | Unix socket (also `./rel/path`, `../rel/path`; `@name` for abstract sockets; `8000-8010:/run/proxy.sock` for all ports of a range) |
 
-`-t`/`--tcp-ports` and `-u`/`--udp-ports` are accepted with `none` only, as
-no-ops, so that `pasta` command lines like
+`-t`/`--tcp-ports` and `-u`/`--udp-ports` specifiers are parsed as in
+`pasta`, but forwarding from the host isn't implemented yet: only `none` is
+accepted, as a no-op, so that `pasta` command lines like
 `pasta -t none -u none -U none -T 8080 -- ...` work unchanged. As in `pasta`,
 `-T none` is an error after other `-T` options, but not before them, and a
 port can't be forwarded twice.
