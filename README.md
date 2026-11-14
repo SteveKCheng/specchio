@@ -163,6 +163,30 @@ everything except standard streams at startup, so the command never gets
 them.) It exits with the command's exit
 status (128 + signal number if the command was killed).
 
+### Signals
+
+specchio forwards `SIGTERM`, `SIGHUP`, `SIGINT`, `SIGQUIT`, `SIGUSR1` and
+`SIGUSR2` to the command, and keeps running, forwarded ports included, until
+the command exits. So a service can shut down gracefully, or reload its
+configuration, when specchio is signalled, by a script or by systemd. With
+systemd, use `KillMode=mixed`: with the default `KillMode=control-group`,
+systemd signals every process of the unit, and a command run directly under
+specchio gets `SIGTERM` twice, which some programs take as "quit now".
+
+- Only signals sent by processes (`kill()`, `sigqueue()`) are forwarded.
+  Ctrl-C, Ctrl-\ and hangups come from the terminal, which sends them to
+  its whole foreground process group, the command included, so specchio
+  ignores them, like a shell waiting for a foreground job.
+- Signals ignored when specchio starts (by `nohup`, or `SIGINT` and
+  `SIGQUIT` for background jobs of non-interactive shells) stay ignored, and
+  aren't forwarded: the command inherits them as ignored, too.
+- If specchio is killed with `SIGKILL`, or crashes, the command is killed
+  with `SIGKILL` (`PR_SET_PDEATHSIG`).
+- Only the command itself is signalled, not its descendants, and those
+  aren't killed with it. `bwrap` doesn't forward signals: a `bwrap` command
+  dies of a forwarded `SIGTERM`, and the sandbox inside either dies abruptly
+  (`--die-with-parent`) or carries on. See `notes/signals.md`.
+
 The command runs with the user and group IDs specchio was started with, and
 without capabilities, so programs (and users) aren't misled into thinking
 they run as root. Supplementary groups show up as the overflow group
@@ -207,8 +231,11 @@ settings, as for any other process.
    directions through a pipe pair. The connection state machine is ported from `tcp_splice.c`
    (`SPLICE_CONNECT`, `OUT_WAIT_n`, `FIN_RCVD_n`, `FIN_SENT_n`, the pipe pool,
    and `SPLICE_F_MORE`/`TCP_NODELAY` corking). The parent waits for the command
-   with a pidfd, and the child gets `PR_SET_PDEATHSIG`, so neither outlives the
-   other.
+   with a pidfd, and forwards signals to it with `pidfd_send_signal()`, read
+   from a `signalfd` (they're blocked before `fork()`, and unblocked again in
+   the child before `exec`). The child gets `PR_SET_PDEATHSIG`, so the
+   command doesn't outlive specchio, and specchio doesn't outlive the
+   command (its descendants can outlive both).
 3. **From the host (`ns.rs`)**: inbound connections and UDP flows need a
    socket in the namespace each, created while the command runs. So the child also sends a
    descriptor for its network namespace, and the parent makes itself

@@ -14,6 +14,7 @@ mod fdpass;
 mod log;
 mod ns;
 mod sandbox;
+mod signals;
 mod splice;
 mod sys;
 mod udp;
@@ -364,6 +365,23 @@ fn peer(target: &Target, conn: &Conn) -> std::io::Result<Option<Peer>> {
 }
 
 
+/// Forward pending signals from @sigfd to the command, at @pidfd, unless the
+/// kernel sent them (the terminal did, to the command too), see signals.rs
+fn forward_signals(sigfd: std::os::fd::RawFd, pidfd: std::os::fd::RawFd) {
+    for s in signals::read(sigfd) {
+        let name = signals::name(s.signo);
+        if !s.user {
+            debug!("{name} from the kernel (terminal), not forwarded");
+            continue;
+        }
+        debug!("{name} from PID {}, forwarding to command", s.pid);
+        if let Err(e) = signals::send(pidfd, s.signo) {
+            // The command might have just exited, we'll see that next
+            debug!("cannot forward {name} to command: {e}");
+        }
+    }
+}
+
 fn run(mut cfg: Config) -> Result<u8, String> {
     cfg.resolve()?;
 
@@ -400,14 +418,18 @@ fn run(mut cfg: Config) -> Result<u8, String> {
         }
     }
 
+    // Before fork(), so that no signal for the command is missed
+    let sigs = signals::block().map_err(|e| format!("cannot block signals: {e}"))?;
+
     let Sandbox { pid, pidfd, mut listeners, netns } =
-        sandbox::spawn(&cfg.command, &ports, cfg.root, &nofile_orig, nhost > 0)
+        sandbox::spawn(&cfg.command, &ports, cfg.root, &nofile_orig, nhost > 0, &sigs.orig_mask)
             .map_err(|e| format!("cannot start sandbox: {e}"))?;
+    let sigfd = sigs.fd().map_err(|e| format!("cannot create signalfd: {e}"))?;
     listeners.extend(host);
 
     // The command has its copies of whatever we inherited: drop ours
     let keep: Vec<_> = listeners.iter().map(|l| l.fd.as_raw_fd())
-        .chain([pidfd.as_raw_fd()])
+        .chain([pidfd.as_raw_fd(), sigfd.as_raw_fd()])
         .chain(netns.as_ref().map(|n| n.as_raw_fd()))
         .collect();
     match sys::drop_inherited(&keep) {
@@ -418,16 +440,10 @@ fn run(mut cfg: Config) -> Result<u8, String> {
         r => r.map_err(|e| format!("cannot close inherited files: {e}"))?,
     }
 
-    // Like a shell waiting for a foreground job, leave terminal-generated
-    // signals to the command: if we terminate, so does the command.
-    // SAFETY: Setting signal dispositions to SIG_IGN
-    unsafe {
-        libc::signal(libc::SIGINT, libc::SIG_IGN);
-        libc::signal(libc::SIGQUIT, libc::SIG_IGN);
-    }
-
     let ep = Epoll::new().map_err(|e| format!("cannot create epoll descriptor: {e}"))?;
     ep.add(pidfd.as_raw_fd(), libc::EPOLLIN as u32, Ref::Child)
+        .map_err(|e| format!("epoll_ctl(): {e}"))?;
+    ep.add(sigfd.as_raw_fd(), libc::EPOLLIN as u32, Ref::Signal)
         .map_err(|e| format!("epoll_ctl(): {e}"))?;
     for (i, l) in listeners.iter().enumerate() {
         ep.add(l.fd.as_raw_fd(), libc::EPOLLIN as u32, Ref::Listener(i))
@@ -478,6 +494,7 @@ fn run(mut cfg: Config) -> Result<u8, String> {
                     debug!("command exited with status {code}");
                     return Ok(code as u8);
                 }
+                Ref::Signal => forward_signals(sigfd.as_raw_fd(), pidfd.as_raw_fd()),
                 Ref::Listener(i) => fwd.listener_event(i),
                 Ref::Conn(id, sidei) => fwd.conn_event(id, sidei, ev),
                 Ref::Flow(id) => fwd.flow_event(id),

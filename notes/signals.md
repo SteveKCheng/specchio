@@ -25,12 +25,16 @@ Contents:
   applies to the **direct child only**: descendants of the command are
   reparented (to init, or the nearest subreaper) and survive. The README's
   "neither outlives the other" is only true for the direct child.
-- specchio ignores `SIGINT` and `SIGQUIT`, like a shell waiting for a
-  foreground job: the terminal sends them to the whole foreground process
-  group, so the command gets them anyway.
-- `SIGTERM`, `SIGHUP` and other signals have their default action:
-  specchio dies at once, and the death signal `SIGKILL`s the command. The
-  command never sees the `SIGTERM`, and can't shut down gracefully.
+- specchio forwards `SIGTERM`, `SIGHUP`, `SIGINT`, `SIGQUIT`, `SIGUSR1`
+  and `SIGUSR2` to the command, and keeps running until the command exits
+  (section 6). It ignores them if they come from the terminal, which sends
+  them to the whole foreground process group, the command included, like a
+  shell waiting for a foreground job.
+- Before signal forwarding, `SIGTERM`, `SIGHUP` and the user signals had
+  their default action: specchio died at once, and the death signal
+  `SIGKILL`ed the command, which never saw the `SIGTERM`, and couldn't shut
+  down gracefully. Other signals with a terminating default action still
+  behave that way.
 
 Correction to a comment in `src/sandbox.rs` (since fixed): it said that
 `unshare()` clears the parent death signal. It doesn't, at least on Linux 7.3: tested
@@ -230,15 +234,35 @@ Considered:
   no longer reaches them, reading the terminal raises `SIGTTIN`); it does
   nothing for `SIGKILL`, which specchio can't act on; and the command can
   leave the group anyway (`setsid()`, which `bwrap --new-session` calls).
-- **Forwarding signals** to the command. Decided: catch `SIGTERM` and
-  `SIGHUP` with a `signalfd` (which fits the epoll loop), forward them to
-  the command, and keep running until it exits, then exit with its status.
-  Also forward `SIGINT` and `SIGQUIT`, but only if they were sent with
-  `kill()` (`si_code` `SI_USER`), not by the terminal (`SI_KERNEL`, from
-  `SEND_SIG_PRIV`), which already sends them to the whole foreground
-  group; this also covers units with `KillSignal=SIGINT`. The `si_code`
-  values are yet to be checked in practice. The death signal stays, as the
-  fallback for `SIGKILL` and crashes.
+- **Forwarding signals** to the command. Implemented (`src/signals.rs`):
+  `SIGTERM`, `SIGHUP`, `SIGINT`, `SIGQUIT`, and also `SIGUSR1` and
+  `SIGUSR2`, which servers commonly use to reload their configuration. They
+  are blocked before `fork()` (the child restores the original mask before
+  `exec`), read from a `signalfd` in the epoll loop, and sent on with
+  `pidfd_send_signal()`. specchio keeps running until the command exits,
+  then exits with its status. The death signal stays, as the fallback for
+  `SIGKILL` and crashes.
+  - Only signals sent from user space are forwarded (`si_code` ≤ 0:
+    `SI_USER` from `kill()`, `SI_QUEUE` from `sigqueue()`, `SI_TKILL`...),
+    not those from the kernel (`SI_KERNEL`). Checked in a pseudo-terminal,
+    with `sigwaitinfo()`: Ctrl-C (`SIGINT`), Ctrl-\ (`SIGQUIT`) and the
+    hangup when the terminal closes (`SIGHUP`) all arrived as `SI_KERNEL`,
+    with `si_pid` 0; `kill()` gave `SI_USER`, `kill -q` (`sigqueue()`)
+    `SI_QUEUE`. The terminal sends those to its whole foreground process
+    group, the command included, so forwarding them would deliver them
+    twice. The rule is the same for all signals, also `SIGHUP` and
+    `SIGTERM`, rather than only for `SIGINT` and `SIGQUIT` as first
+    planned. Tested: Ctrl-C reaches a command that traps it once, and a
+    plain command killed by it makes specchio exit with 130. This also
+    covers units with `KillSignal=SIGINT`.
+  - Signals ignored when specchio starts stay ignored, and aren't
+    forwarded: the command inherits them as ignored too, across `exec`.
+    This respects `nohup`, and non-interactive shells, which start
+    background jobs with `SIGINT` and `SIGQUIT` ignored. (A blocked signal
+    that is ignored is discarded, and would never reach the `signalfd`
+    anyway.)
+  - Signals still reach the command only, not its descendants: with `bwrap`
+    in between, see below.
 - **Becoming a child subreaper** (`PR_SET_CHILD_SUBREAPER`), and exiting
   only once no children are left. Deferred. It would keep specchio, and
   the forwarded ports, alive while the rest of the sandbox shuts down:

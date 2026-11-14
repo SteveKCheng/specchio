@@ -16,8 +16,10 @@ pub enum Ref {
     Listener(usize),
     /// Socket of a spliced connection, by connection index and side
     Conn(usize, usize),
-    /// Host side socket of a UDP flow, by flow index
+    /// Socket of a UDP flow, on the target side, by flow index
     Flow(usize),
+    /// signalfd for signals to forward
+    Signal,
 }
 
 const TAG_SHIFT: u32 = 56;
@@ -25,6 +27,7 @@ const TAG_CHILD: u64 = 1;
 const TAG_LISTENER: u64 = 2;
 const TAG_CONN: u64 = 3;
 const TAG_FLOW: u64 = 4;
+const TAG_SIGNAL: u64 = 5;
 
 impl Ref {
     fn encode(self) -> u64 {
@@ -33,6 +36,7 @@ impl Ref {
             Ref::Listener(i) => TAG_LISTENER << TAG_SHIFT | i as u64,
             Ref::Conn(i, sidei) => TAG_CONN << TAG_SHIFT | (i as u64) << 1 | sidei as u64,
             Ref::Flow(i) => TAG_FLOW << TAG_SHIFT | i as u64,
+            Ref::Signal => TAG_SIGNAL << TAG_SHIFT,
         }
     }
 
@@ -43,6 +47,7 @@ impl Ref {
             TAG_LISTENER => Ref::Listener(payload as usize),
             TAG_CONN => Ref::Conn((payload >> 1) as usize, (payload & 1) as usize),
             TAG_FLOW => Ref::Flow(payload as usize),
+            TAG_SIGNAL => Ref::Signal,
             _ => unreachable!("bad epoll reference {v:#x}"),
         }
     }

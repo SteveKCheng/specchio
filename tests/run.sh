@@ -228,6 +228,69 @@ check "--root: command runs as root" sh -c "'${B}' --root -- sh -c '
 check "started as root: command stays root" unshare -r sh -c "'${B}' -- sh -c '
 	test \$(id -u) = 0 && ip link set lo down'"
 
+# Run "specchio OPTION... -- sh -c SCRIPT" in the background, as SPID, with
+# SIGINT and SIGQUIT not ignored (unlike in background jobs), and wait until
+# SCRIPT touches the file given as $0
+sig_spawn() {
+	script="$1"; shift
+	rm -f "${TMP}/ready" "${TMP}/log"
+	env --default-signal=INT,QUIT "${B}" "$@" -- sh -c "${script}" "${TMP}/ready" &
+	SPID=$!
+	i=0; until [ -e "${TMP}/ready" ]; do
+		i=$((i + 1)); [ ${i} -lt 200 ] || return 1; sleep 0.05
+	done
+}
+
+# Forwarded signals: the command handles them, and shuts down slowly on
+# SIGTERM, using a forwarded port, while specchio keeps running
+sig_forward() {
+	sig_spawn '
+	for s in HUP INT QUIT USR1 USR2; do trap "echo ${s} >> $0.log" ${s}; done
+	trap "sleep 0.5; echo hi | socat -t1 - TCP:127.0.0.1:8000 >> $0.log; exit 42" TERM
+	touch "$0"; while :; do sleep 0.1; done' -T 8000:"${TMP}/echo.sock" || return 1
+	for s in HUP INT QUIT USR1 USR2 TERM; do kill -s ${s} "${SPID}"; sleep 0.3; done
+	r=0; wait "${SPID}" || r=$?
+	[ ${r} -eq 42 ] || { echo "exit status ${r}"; return 1; }
+	[ "$(tr '\n' ' ' < "${TMP}/ready.log")" = "HUP INT QUIT USR1 USR2 hi " ] ||
+		{ cat "${TMP}/ready.log"; return 1; }
+}
+check "signals: forwarded, specchio runs until the command exits" sig_forward
+
+sig_unhandled() {
+	sig_spawn 'touch "$0"; while :; do sleep 0.1; done' || return 1
+	kill -s USR1 "${SPID}"
+	r=0; wait "${SPID}" || r=$?
+	[ ${r} -eq $((128 + 10)) ] || { echo "exit status ${r}"; return 1; }
+}
+check "signals: command killed by forwarded signal, status passed through" sig_unhandled
+
+# Ignored signals stay ignored, as with nohup
+sig_ignored() {
+	rm -f "${TMP}/ready"
+	sh -c "trap '' HUP; exec '${B}' -- sh -c 'trap \"exit 3\" TERM; touch \"\$0\"
+		while :; do sleep 0.1; done' '${TMP}/ready'" & SPID=$!
+	i=0; until [ -e "${TMP}/ready" ]; do
+		i=$((i + 1)); [ ${i} -lt 200 ] || return 1; sleep 0.05
+	done
+	kill -s HUP "${SPID}"; sleep 0.3; kill -s TERM "${SPID}"
+	r=0; wait "${SPID}" || r=$?
+	[ ${r} -eq 3 ] || { echo "exit status ${r}"; return 1; }
+}
+check "signals: ignored on entry, not forwarded" sig_ignored
+
+# The terminal sends Ctrl-C and Ctrl-\ to the command already: once is enough
+check "signals: from the terminal, not forwarded" sh -c "
+	python3 '${TESTS}/terminal.py' '\\x03\\x1c' '${B}' -- sh -c '
+		trap \"echo INT >> ${TMP}/tty.log\" INT; trap \"exit 5\" QUIT
+		while :; do sleep 0.1; done' | grep -qx 5 &&
+	test \"\$(cat '${TMP}/tty.log')\" = INT &&
+	python3 '${TESTS}/terminal.py' '\\x03' '${B}' -- sleep 30 | grep -qx 130"
+
+check "SIGKILL to specchio kills the command" sh -c "
+	'${B}' -- sh -c 'echo \$\$ > ${TMP}/cmd.pid; exec sleep 30' & pid=\$!
+	until [ -s '${TMP}/cmd.pid' ]; do sleep 0.05; done; sleep 0.2
+	kill -s KILL \${pid}; sleep 0.3; ! kill -0 \$(cat '${TMP}/cmd.pid') 2>/dev/null"
+
 check "exit status passed through" sh -c "'${B}' -- sh -c 'exit 7'; test \$? -eq 7"
 
 check "no descriptors leaked to command" sh -c "'${B}' -T 8000:'${TMP}/echo.sock' -U 53 \

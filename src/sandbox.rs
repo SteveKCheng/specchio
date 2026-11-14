@@ -66,8 +66,9 @@ pub struct Sandbox {
 /// @nofile is the original RLIMIT_NOFILE, restored for the command
 /// @netns: join the sandbox's user namespace, and return a descriptor for its
 ///         network namespace, so that threads can create sockets there
+/// @sigmask is the original signal mask, restored for the command
 pub fn spawn(command: &[OsString], ports: &[(Proto, u16)], root: bool, nofile: &libc::rlimit,
-             netns: bool) -> io::Result<Sandbox> {
+             netns: bool, sigmask: &libc::sigset_t) -> io::Result<Sandbox> {
     // Prepare everything that allocates before fork()
     let argv: Vec<CString> = command.iter()
         .map(|a| CString::new(a.as_bytes()))
@@ -92,7 +93,7 @@ pub fn spawn(command: &[OsString], ports: &[(Proto, u16)], root: bool, nofile: &
     let pid = cvt(unsafe { libc::fork() })?;
     if pid == 0 {
         drop(ours);
-        child(theirs, uid, gid, ppid, ports, root, netns, nofile, &argvp);
+        child(theirs, uid, gid, ppid, ports, root, netns, nofile, sigmask, &argvp);
     }
     drop(theirs);
 
@@ -182,7 +183,7 @@ pub fn reap(pid: libc::pid_t) -> i32 {
 #[allow(clippy::too_many_arguments)]
 fn child(sock: OwnedFd, uid: libc::uid_t, gid: libc::gid_t, ppid: libc::pid_t,
          ports: &[(Proto, u16)], root: bool, netns: bool, nofile: &libc::rlimit,
-         argv: &[*const libc::c_char]) -> ! {
+         sigmask: &libc::sigset_t, argv: &[*const libc::c_char]) -> ! {
     match child_setup(uid, gid, ppid, ports, root, netns) {
         Ok(fds) => {
             let raw: Vec<RawFd> = fds.iter().map(|f| f.as_raw_fd()).collect();
@@ -213,10 +214,12 @@ fn child(sock: OwnedFd, uid: libc::uid_t, gid: libc::gid_t, ppid: libc::pid_t,
     }
     drop(sock);
 
-    // SAFETY: Restoring signal dispositions and limits for the command: Rust
-    // ignores SIGPIPE by default, and that would be inherited across exec()
+    // SAFETY: Restoring signal dispositions, mask and limits for the command:
+    // Rust ignores SIGPIPE by default, and that would be inherited across
+    // exec(), as would the signals blocked for forwarding
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        crate::signals::restore(sigmask);
         libc::setrlimit(libc::RLIMIT_NOFILE, nofile);
         libc::execvp(argv[0], argv.as_ptr());
     }
