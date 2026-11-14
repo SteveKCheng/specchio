@@ -5,7 +5,7 @@
 use std::ffi::OsString;
 use std::fmt;
 use std::mem::{offset_of, size_of, zeroed};
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 
@@ -208,6 +208,17 @@ impl Target {
 impl fmt::Display for Target {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str(&self.describe(0))
+    }
+}
+
+/// Target address for Target::Ip without an address: @local, the address a
+/// client connected or sent to, if it's a loopback address, the loopback
+/// address of the same version otherwise
+pub fn auto_addr(local: IpAddr) -> IpAddr {
+    match local {
+        a if a.is_loopback() => a,
+        IpAddr::V4(_) => Ipv4Addr::LOCALHOST.into(),
+        IpAddr::V6(_) => Ipv6Addr::LOCALHOST.into(),
     }
 }
 
@@ -967,6 +978,15 @@ mod tests {
         }
         assert!(args(&["-t", "none", "-t", "80", "-T", "80", "-T", "none", "true"]).is_err());
         assert!(args(&["-t", "none", "-t", "80", "-T", "none", "-u", "none", "true"]).is_ok());
+    }
+
+    #[test]
+    fn auto_addresses() {
+        let auto = |a: &str| auto_addr(a.parse().unwrap()).to_string();
+        assert_eq!(auto("127.0.0.5"), "127.0.0.5");
+        assert_eq!(auto("::1"), "::1");
+        assert_eq!(auto("192.0.2.1"), "127.0.0.1");
+        assert_eq!(auto("2001:db8::1"), "::1");
     }
 
     #[test]

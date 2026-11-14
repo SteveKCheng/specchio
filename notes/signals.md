@@ -43,9 +43,9 @@ binary, and changes of effective or filesystem user or group IDs. The
 specchio died before that point.
 
 Also: the death signal is sent when the parent *thread* exits, not the
-parent process. If specchio ever uses threads (for example, to create
-sockets in the sandbox for inbound forwarding), the `fork()` of the
-child must stay on the main thread.
+parent process. specchio now uses short-lived threads to create sockets in
+the sandbox for inbound forwarding, so the `fork()` of the child must stay
+on the main thread, as it does (it happens before any thread is started).
 
 ## 2. Experiments
 
@@ -268,7 +268,7 @@ Suggested usage, for now:
 
 ## 7. Who can signal or trace whom
 
-Found while looking at inbound forwarding, where specchio would have to
+Found while looking at inbound forwarding, where specchio has to
 join the sandbox's user namespace (to `setns()` into its network
 namespace); `user-ns.md` has the details.
 

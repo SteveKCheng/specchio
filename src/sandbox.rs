@@ -13,13 +13,17 @@
 //! 2. bring up the loopback interface
 //! 3. create the listening sockets (TCP) and receiving sockets (UDP) for all
 //!    forwarded ports
-//! 4. send them to the parent with SCM_RIGHTS over a socketpair, in batches
-//! 5. unless asked to keep root, unshare() a nested user namespace mapping the
+//! 4. unless asked to keep root, unshare() a nested user namespace mapping the
 //!    original UID and GID to root of the first one, so that the command runs
 //!    with its original IDs, and without capabilities once it's exec()ed
-//! 6. close everything and exec() the command
+//! 5. send the sockets to the parent with SCM_RIGHTS over a socketpair, in
+//!    batches, followed by a descriptor for the network namespace if the
+//!    parent needs to create sockets there later (inbound forwarding)
+//! 6. wait for the parent to be ready, close everything and exec() the command
 //!
-//! The parent never needs any capability, or to enter any namespace.
+//! For outbound forwarding only, the parent never needs any capability, or to
+//! enter any namespace.  For inbound forwarding, it joins the sandbox's user
+//! namespace before letting the child go on, see ns.rs.
 
 use std::ffi::{CString, OsString};
 use std::io::{self, Write as _};
@@ -28,7 +32,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 
-use crate::config::Proto;
+use crate::config::{Bind, Proto};
 use crate::fdpass;
 use crate::sys::{self, cvt};
 
@@ -36,17 +40,21 @@ use crate::sys::{self, cvt};
 const MSG_OK: u8 = b'K';
 const MSG_ERR: u8 = b'E';
 
-/// Listening (TCP) or receiving (UDP) socket inside the sandbox
+/// Listening (TCP) or receiving (UDP) socket, in the sandbox, or on the host
+/// for inbound forwarding
 pub struct Listener {
     pub fd: OwnedFd,
     pub addr: SocketAddr,
     pub proto: Proto,
+    pub inbound: bool,
 }
 
 pub struct Sandbox {
     pub pid: libc::pid_t,
     pub pidfd: OwnedFd,
     pub listeners: Vec<Listener>,
+    /// Network namespace, joinable from a thread, if requested
+    pub netns: Option<OwnedFd>,
 }
 
 /// Start @command in a new sandbox, with a socket for each of @ports, in order
@@ -54,8 +62,10 @@ pub struct Sandbox {
 /// @root: run the command as root in the sandbox's user namespace, instead of
 ///        with the original user and group IDs
 /// @nofile is the original RLIMIT_NOFILE, restored for the command
-pub fn spawn(command: &[OsString], ports: &[(Proto, u16)], root: bool, nofile: &libc::rlimit)
-             -> io::Result<Sandbox> {
+/// @netns: join the sandbox's user namespace, and return a descriptor for its
+///         network namespace, so that threads can create sockets there
+pub fn spawn(command: &[OsString], ports: &[(Proto, u16)], root: bool, nofile: &libc::rlimit,
+             netns: bool) -> io::Result<Sandbox> {
     // Prepare everything that allocates before fork()
     let argv: Vec<CString> = command.iter()
         .map(|a| CString::new(a.as_bytes()))
@@ -80,42 +90,46 @@ pub fn spawn(command: &[OsString], ports: &[(Proto, u16)], root: bool, nofile: &
     let pid = cvt(unsafe { libc::fork() })?;
     if pid == 0 {
         drop(ours);
-        child(theirs, uid, gid, ppid, ports, root, nofile, &argvp);
+        child(theirs, uid, gid, ppid, ports, root, netns, nofile, &argvp);
     }
     drop(theirs);
 
-    let fds = match recv_sockets(&ours, ports.len()) {
-        Ok(fds) => fds,
-        Err(e) => {
-            // The child exits by itself on errors, but not if the message was
-            // malformed: make sure it doesn't run the command
-            // SAFETY: Signalling our own unreaped child
-            unsafe { libc::kill(pid, libc::SIGKILL) };
-            reap(pid);
-            return Err(e);
-        }
-    };
-    let listeners = fds.into_iter().zip(ports)
-        .map(|(fd, &(proto, _))| {
-            let addr = sys::local_addr(fd.as_raw_fd())?;
-            Ok(Listener { fd, addr, proto })
-        })
-        .collect::<io::Result<_>>()?;
+    // The child doesn't run the command until we say so: on errors, make sure
+    // it's gone.  It also exits by itself if we do
+    let parent = || -> io::Result<Sandbox> {
+        let mut fds = recv_sockets(&ours, ports.len() + usize::from(netns))?;
+        let netns = if netns { fds.pop() } else { None };
+        let listeners = fds.into_iter().zip(ports)
+            .map(|(fd, &(proto, _))| {
+                let addr = sys::local_addr(fd.as_raw_fd())?;
+                Ok(Listener { fd, addr, proto, inbound: false })
+            })
+            .collect::<io::Result<_>>()?;
 
-    // SAFETY: pidfd_open() has no memory safety preconditions.  The child is
-    // not reaped yet, so the PID can't be reused.
-    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-    if pidfd < 0 {
-        let e = io::Error::last_os_error();
+        if let Some(netns) = &netns {
+            crate::ns::join(netns).map_err(|e| {
+                io::Error::new(e.kind(), format!("cannot join user namespace of sandbox: {e}"))
+            })?;
+        }
+
+        // SAFETY: pidfd_open() has no memory safety preconditions.  The child
+        // is not reaped yet, so the PID can't be reused.
+        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if pidfd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: pidfd was just created and is owned by nobody else
+        let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd as RawFd) };
+
+        fdpass::send(ours.as_fd(), &[MSG_OK], &[])?;
+        Ok(Sandbox { pid, pidfd, listeners, netns })
+    };
+
+    parent().inspect_err(|_| {
         // SAFETY: Signalling our own unreaped child
         unsafe { libc::kill(pid, libc::SIGKILL) };
         reap(pid);
-        return Err(e);
-    }
-    // SAFETY: pidfd was just created and is owned by nobody else
-    let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd as RawFd) };
-
-    Ok(Sandbox { pid, pidfd, listeners })
+    })
 }
 
 /// Receive @n sockets from the child, in batches of at most fdpass::MAX_FDS
@@ -161,12 +175,13 @@ pub fn reap(pid: libc::pid_t) -> i32 {
     }
 }
 
-/// Body of the child process: set up the sandbox, report back, exec()
+/// Body of the child process: set up the sandbox, report back, wait for the
+/// parent, exec()
 #[allow(clippy::too_many_arguments)]
 fn child(sock: OwnedFd, uid: libc::uid_t, gid: libc::gid_t, ppid: libc::pid_t,
-         ports: &[(Proto, u16)], root: bool, nofile: &libc::rlimit,
+         ports: &[(Proto, u16)], root: bool, netns: bool, nofile: &libc::rlimit,
          argv: &[*const libc::c_char]) -> ! {
-    match child_setup(uid, gid, ppid, ports, root) {
+    match child_setup(uid, gid, ppid, ports, root, netns) {
         Ok(fds) => {
             let raw: Vec<RawFd> = fds.iter().map(|f| f.as_raw_fd()).collect();
             // At least one message, even without sockets
@@ -178,6 +193,13 @@ fn child(sock: OwnedFd, uid: libc::uid_t, gid: libc::gid_t, ppid: libc::pid_t,
             }
             // The command must not get hold of the listening sockets
             drop(fds);
+
+            // Wait for the parent: nothing (EOF) if it failed or exited
+            let mut buf = [0u8; 1];
+            if !matches!(fdpass::recv(sock.as_fd(), &mut buf), Ok((1, _))) || buf[0] != MSG_OK {
+                // SAFETY: Leaving without running any destructors is fine
+                unsafe { libc::_exit(1) };
+            }
         }
         Err(why) => {
             let mut msg = vec![MSG_ERR];
@@ -207,9 +229,11 @@ fn child(sock: OwnedFd, uid: libc::uid_t, gid: libc::gid_t, ppid: libc::pid_t,
 
 /// Set up namespaces and sockets in the child
 ///
-/// Return: sockets for the parent, or error string
+/// Return: sockets for the parent, followed by the network namespace if
+///         @netns is set, or error string
 fn child_setup(uid: libc::uid_t, gid: libc::gid_t, ppid: libc::pid_t,
-               ports: &[(Proto, u16)], root: bool) -> Result<Vec<OwnedFd>, String> {
+               ports: &[(Proto, u16)], root: bool, netns: bool)
+               -> Result<Vec<OwnedFd>, String> {
     // SAFETY: unshare() has no memory safety preconditions
     cvt(unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) })
         .map_err(|e| format!("cannot create namespaces: {e}"))?;
@@ -227,11 +251,17 @@ fn child_setup(uid: libc::uid_t, gid: libc::gid_t, ppid: libc::pid_t,
 
     loopback_up().map_err(|e| format!("cannot bring up loopback interface: {e}"))?;
 
-    let fds = ports.iter()
+    let mut fds: Vec<OwnedFd> = ports.iter()
         .map(|&(proto, port)| listen(proto, port).map_err(|e| {
             format!("cannot listen on {} port {port} in namespace: {e}", proto.name())
         }))
         .collect::<Result<_, _>>()?;
+
+    if netns {
+        let ns = std::fs::File::open("/proc/self/ns/net")
+            .map_err(|e| format!("cannot open /proc/self/ns/net: {e}"))?;
+        fds.push(ns.into());
+    }
 
     // Drop "fake root" for the command: in a nested user namespace, map the
     // original IDs to root of the sandbox's user namespace, which we are now.
@@ -291,15 +321,36 @@ fn loopback_up() -> io::Result<()> {
 /// on the loopback interface, dual-stack if IPv6 is available, like pasta
 /// does for -T and -U
 fn listen(proto: Proto, port: u16) -> io::Result<OwnedFd> {
-    match listen_on(proto, &SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port)) {
+    listen_any(proto, port, Some("lo"))
+}
+
+/// Create a non-blocking socket listening (TCP) or receiving (UDP) on @port
+/// on all addresses, dual-stack if IPv6 is available, on device @dev if given
+fn listen_any(proto: Proto, port: u16, dev: Option<&str>) -> io::Result<OwnedFd> {
+    match listen_on(proto, &SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port), false, dev) {
         Err(e) if matches!(e.raw_os_error(), Some(libc::EAFNOSUPPORT | libc::EADDRNOTAVAIL)) => {
-            listen_on(proto, &SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port))
+            listen_on(proto, &SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port), false, dev)
         }
         r => r,
     }
 }
 
-fn listen_on(proto: Proto, addr: &SocketAddr) -> io::Result<OwnedFd> {
+/// Create a non-blocking socket listening (TCP) or receiving (UDP) on @port
+/// on the host, at @bind, for inbound forwarding, like pasta does for -t, -u
+pub fn listen_host(proto: Proto, bind: &Bind, port: u16) -> io::Result<Listener> {
+    let dev = bind.ifname.as_deref();
+    let fd = match bind.addr {
+        None => listen_any(proto, port, dev)?,
+        // An unspecified IPv6 address is IPv6 only, as opposed to no address
+        Some(a) => listen_on(proto, &SocketAddr::new(a, port), true, dev)?,
+    };
+    let addr = sys::local_addr(fd.as_raw_fd())?;
+    Ok(Listener { fd, addr, proto, inbound: true })
+}
+
+/// Create a socket listening on @addr, IPv6 only if @v6only, on @dev if given
+fn listen_on(proto: Proto, addr: &SocketAddr, v6only: bool, dev: Option<&str>)
+             -> io::Result<OwnedFd> {
     let af = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
     let ty = match proto {
         Proto::Tcp => libc::SOCK_STREAM,
@@ -310,25 +361,28 @@ fn listen_on(proto: Proto, addr: &SocketAddr) -> io::Result<OwnedFd> {
 
     match proto {
         Proto::Tcp => sys::setsockopt_int(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, 1)?,
-        // Not SO_REUSEADDR: the command could bind the same port with it, and
-        // take datagrams from us.  We need the destination address of
-        // datagrams, to reply from it (see udp.rs)
+        // Not SO_REUSEADDR: another process (in the namespace, the command)
+        // could bind the same port with it, and take datagrams from us.  We
+        // need the destination address of datagrams, to reply from it (see
+        // udp.rs)
         Proto::Udp if addr.is_ipv6() => {
             sys::setsockopt_int(fd, libc::IPPROTO_IPV6, libc::IPV6_RECVPKTINFO, 1)?;
         }
         Proto::Udp => sys::setsockopt_int(fd, libc::IPPROTO_IP, libc::IP_PKTINFO, 1)?,
     }
     if addr.is_ipv6() {
-        sys::setsockopt_int(fd, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, 0)?;
+        sys::setsockopt_int(fd, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, i32::from(v6only))?;
     }
 
-    // Only lo exists now, but the command could add interfaces (it has
-    // CAP_NET_ADMIN in the namespace): don't accept connections from those
-    // SAFETY: Passing a valid buffer and its length
-    cvt(unsafe {
-        libc::setsockopt(s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_BINDTODEVICE,
-                         c"lo".as_ptr().cast(), 3)
-    })?;
+    // In the namespace, only lo exists now, but the command could add
+    // interfaces with --root: don't accept connections from those
+    if let Some(dev) = dev {
+        // SAFETY: Passing a valid buffer and its length
+        cvt(unsafe {
+            libc::setsockopt(s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_BINDTODEVICE,
+                             dev.as_ptr().cast(), dev.len() as libc::socklen_t)
+        })?;
+    }
 
     let (sa, len) = sys::sockaddr_ip(addr);
     // SAFETY: sa is a valid socket address of length len

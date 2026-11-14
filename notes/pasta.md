@@ -494,11 +494,14 @@ everything up itself before `exec`ing the command (`src/sandbox.rs`):
 2. Bring `lo` up (`SIOCSIFFLAGS`).
 3. Create the listening sockets: one per `-T` port, dual-stack, bound to `lo`
    with `SO_BINDTODEVICE`.
-4. Send them to the parent with `SCM_RIGHTS` over a `socketpair`.
-5. Unless `--root` is given, create a nested user namespace mapping the
+4. Unless `--root` is given, create a nested user namespace mapping the
    original UID/GID to root of the first one, so that the command runs with
    its original IDs and without capabilities (see `user-ns.md`, section 5).
-6. Close the sockets and `exec` the command.
+5. Send the sockets to the parent with `SCM_RIGHTS` over a `socketpair`,
+   followed by a descriptor for the network namespace if there's inbound
+   forwarding.
+6. Close the sockets, wait for the parent to be ready, and `exec` the
+   command.
 
 Compared to Option A:
 
@@ -513,8 +516,10 @@ Compared to Option A:
   for how that holds once the parent joins the sandbox's user namespace).
 - The cost: no new sockets in the sandbox namespace after `exec`. That matters
   for **inbound** forwarding (`-t`), which needs a sandbox-side socket per
-  connection, and a pool sent at startup can't be refilled. The options, and
-  the plan, are in `user-ns.md`.
+  connection, and a pool sent at startup can't be refilled. So for inbound
+  forwarding, specchio does what Option A does on top: it joins the
+  sandbox's user namespace, and refills pools of sockets from a thread that
+  enters the network namespace. See `user-ns.md`.
 
 ---
 

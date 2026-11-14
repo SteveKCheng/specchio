@@ -223,7 +223,91 @@ check "started as root: command stays root" unshare -r sh -c "'${B}' -- sh -c '
 
 check "exit status passed through" sh -c "'${B}' -- sh -c 'exit 7'; test \$? -eq 7"
 
-check "no descriptors leaked to command" sh -c "'${B}' -T 8000:'${TMP}/echo.sock' -U 53 -- \
-	sh -c 'ls /proc/self/fd' | sort -n | tr '\n' ' ' | grep -qx '0 1 2 3 '"
+check "no descriptors leaked to command" sh -c "'${B}' -T 8000:'${TMP}/echo.sock' -U 53 \
+	-t 28000 -- sh -c 'ls /proc/self/fd' | sort -n | tr '\n' ' ' | grep -qx '0 1 2 3 '"
+
+# Run "specchio OPTION... -- SERVER [ARG]..." in the background, as SPID, and
+# wait until something accepts connections on 127.0.0.1 port 8000 in there.
+# The server is the command itself, so that it can't outlive specchio
+serve() {
+	opts=""; while [ "$1" != -- ]; do opts="${opts} $1"; shift; done; shift
+	rm -f "${TMP}/ready"
+	# shellcheck disable=SC2086
+	"${B}" ${opts} -- sh -c '{ until python3 -c "import socket
+socket.create_connection((\"127.0.0.1\", 8000))" 2>/dev/null; do sleep 0.05; done
+		touch "$0"; } & exec "$@"' "${TMP}/ready" "$@" >/dev/null & SPID=$!
+	i=0; until [ -e "${TMP}/ready" ]; do
+		i=$((i + 1)); [ ${i} -lt 200 ] || { kill "${SPID}"; return 1; }; sleep 0.05
+	done
+}
+
+# Connect to ADDR PORT on the host, forwarded into the sandbox, with a server
+# on 0.0.0.0 and [::] port 8000 in there, check echo and address reached, or
+# the last line of the client's error
+tin() {
+	expect="$1"; addr="$2"; port="$3"; shift 3
+	serve "$@" -- python3 "${TESTS}/tcp_server.py" 0.0.0.0:8000 [::]:8000 || return 1
+	out="$(python3 "${TESTS}/tcp_client.py" "${addr}" "${port}" 2>&1 | tail -n 1)"
+	kill "${SPID}"; wait "${SPID}" || :
+	[ "${out}" = "${expect}" ] || { echo "got: ${out}"; return 1; }
+}
+
+check "TCP in, same loopback address" tin "127.0.0.5 8000" 127.0.0.5 28000 -t 28000:8000
+check "TCP in, IPv6 loopback" tin "::1 8000" ::1 28000 -t 28000:8000
+check "TCP in, listening address" tin "127.0.0.1 8000" 127.0.0.1 28000 \
+	-t 127.0.0.1/28000:8000
+check "TCP in, other address: refused on host" tin \
+	"ConnectionRefusedError: [Errno 111] Connection refused" ::1 28000 -t 127.0.0.1/28000:8000
+check "TCP in, target address of other version" tin "127.0.0.2 8000" ::1 28000 \
+	-t 28000:127.0.0.2/8000
+check "TCP in, range" tin "127.0.0.1 8000" 127.0.0.1 28000 -t 27995-28005:7995-8005
+check "TCP in, with outbound forwards" tin "127.0.0.1 8000" 127.0.0.1 28000 \
+	-T 18000 -U 18000 -t 28001,28000:8000 -T 28000
+check "TCP in, refused port resets connection" tin \
+	"ConnectionResetError: [Errno 104] Connection reset by peer" 127.0.0.1 28000 -t 28000:8001
+
+check "TCP in, port in use on host: command not run" sh -c "
+	! '${B}' -t 18000 -- touch '${TMP}/ran' 2>'${TMP}/err' && ! test -e '${TMP}/ran' &&
+	grep -q 'cannot listen on TCP port 18000 at \\* on the host' '${TMP}/err'"
+
+tin_bulk() {
+	serve -t 28500:8000 -- python3 "${TESTS}/bulk_server.py" tcp:127.0.0.1:8000 50000000 ||
+		return 1
+	r=0; timeout 60 python3 "${TESTS}/bulk_client.py" 28500 50000000 20 || r=1
+	kill "${SPID}"; wait "${SPID}" || :
+	return ${r}
+}
+check "TCP in, bulk, 20 x 50 MB each way, half-close" tin_bulk
+
+# Pools of sockets in the namespace are refilled, and specchio is left with a
+# single thread
+tin_many() {
+	# With socat's default backlog of 5, the kernel resets some connections
+	serve -t 28000:8000 -- socat TCP-LISTEN:8000,fork,reuseaddr,backlog=128 EXEC:cat ||
+		return 1
+	r=0; timeout 60 python3 -c '
+import socket, sys, concurrent.futures as cf
+def one(i):
+    s = socket.create_connection(("127.0.0.1", 28000)); m = f"msg {i}".encode()
+    s.sendall(m); s.shutdown(socket.SHUT_WR); r = b""
+    while (b := s.recv(100)): r += b
+    return r == m
+with cf.ThreadPoolExecutor(50) as ex: sys.exit(0 if all(ex.map(one, range(500))) else 1)' || r=1
+	grep -q "^Threads:[[:space:]]*1$" "/proc/${SPID}/status" || { echo "threads left"; r=1; }
+	kill "${SPID}"; wait "${SPID}" || :
+	return ${r}
+}
+check "TCP in, 500 short connections, 50 concurrent" tin_many
+
+# specchio joined the user namespace of the sandbox, where the command is root
+check "TCP in, --root: command can't take descriptors from specchio or trace it" \
+	"${B}" --root -t 28000 -- python3 -c '
+import ctypes, os
+libc = ctypes.CDLL(None, use_errno=True)
+assert os.getuid() == 0
+pfd = os.pidfd_open(os.getppid())
+for fd in range(3, 64):
+    assert libc.syscall(438, pfd, fd, 0) < 0 and ctypes.get_errno() == 1, fd  # pidfd_getfd
+assert libc.ptrace(16, os.getppid(), 0, 0) < 0 and ctypes.get_errno() == 1  # PTRACE_ATTACH'
 
 exit ${fail}

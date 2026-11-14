@@ -11,8 +11,8 @@
 //! Data is moved between the two sockets of a connection using a pair of
 //! splice() syscalls per direction, through an intermediate pipe, without
 //! copying it to userspace.  Side 0 is the accepted socket, side 1 is the
-//! socket we connect to the target.  Connections are tracked using these
-//! events:
+//! socket we connect to the target: on the host, or in the namespace for
+//! inbound connections.  Connections are tracked using these events:
 //!
 //! - SPLICE_CONNECT:       connection accepted, connecting to target
 //! - SPLICE_ESTABLISHED:   connection to target established
@@ -55,6 +55,7 @@ const EVENT_STR: [&str; 8] = [
     "FIN_RCVD_0", "FIN_RCVD_1", "FIN_SENT_0", "FIN_SENT_1",
 ];
 
+/// Names of sides, for outbound connections: reversed for inbound ones
 const SIDE_STR: [&str; 2] = ["namespace", "host"];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -68,6 +69,17 @@ pub enum SockKind {
 pub enum Peer {
     Tcp(SocketAddr),
     Unix(libc::sockaddr_un, libc::socklen_t),
+}
+
+impl Peer {
+    /// Address family of sockets to connect to this peer
+    pub fn family(&self) -> i32 {
+        match self {
+            Peer::Tcp(SocketAddr::V4(_)) => libc::AF_INET,
+            Peer::Tcp(SocketAddr::V6(_)) => libc::AF_INET6,
+            Peer::Unix(..) => libc::AF_UNIX,
+        }
+    }
 }
 
 pub struct Pipe {
@@ -150,6 +162,8 @@ pub struct Conn {
     id: usize,
     /// Index of the listener the connection came from, which has a target
     fwd: usize,
+    /// Accepted on the host, connected in the namespace
+    inbound: bool,
     /// Index of the target address being tried, see connect_reset()
     attempt: usize,
     s: [Option<OwnedFd>; 2],
@@ -187,14 +201,15 @@ fn conn_epoll_events(events: u8, sidei: usize) -> u32 {
 }
 
 impl Conn {
-    /// New connection from accepted (TCP) socket @s0
-    pub fn new(id: usize, fwd: usize, s0: OwnedFd) -> Self {
+    /// New connection from accepted (TCP) socket @s0, on the host if @inbound
+    pub fn new(id: usize, fwd: usize, s0: OwnedFd, inbound: bool) -> Self {
         if sys::setsockopt_int(s0.as_raw_fd(), libc::SOL_TCP, libc::TCP_QUICKACK, 1).is_err() {
             debug!("conn {id}: failed to set TCP_QUICKACK");
         }
         Conn {
             id,
             fwd,
+            inbound,
             attempt: 0,
             s: [Some(s0), None],
             kind: [SockKind::Tcp, SockKind::Unix],
@@ -218,12 +233,21 @@ impl Conn {
         self.fwd
     }
 
+    pub fn inbound(&self) -> bool {
+        self.inbound
+    }
+
     pub fn attempt(&self) -> usize {
         self.attempt
     }
 
     pub fn fd(&self, sidei: usize) -> RawFd {
         self.s[sidei].as_ref().map_or(-1, |s| s.as_raw_fd())
+    }
+
+    /// Name of side @sidei: "namespace" or "host"
+    pub fn side(&self, sidei: usize) -> &'static str {
+        SIDE_STR[sidei ^ usize::from(self.inbound)]
     }
 
     /// Update epoll state from connection events
@@ -315,20 +339,24 @@ impl Conn {
         Ok(())
     }
 
-    /// Create and connect socket to @peer
+    /// Create and connect socket to @peer, or use non-blocking socket @sock,
+    /// of the matching family, if given (see Peer::family())
     ///
     /// On error, the caller should reset the connection with rst()
     ///
     /// Return: Ok(false) if the caller should call this again later, because
     ///         the listen backlog of a Unix domain socket @peer is full
-    pub fn connect(&mut self, ep: &Epoll, pool: &mut PipePool, peer: &Peer) -> io::Result<bool> {
+    pub fn connect(&mut self, ep: &Epoll, pool: &mut PipePool, peer: &Peer,
+                   sock: Option<OwnedFd>) -> io::Result<bool> {
         if self.s[1].is_none() {
-            let (af, kind) = match peer {
-                Peer::Tcp(SocketAddr::V4(_)) => (libc::AF_INET, SockKind::Tcp),
-                Peer::Tcp(SocketAddr::V6(_)) => (libc::AF_INET6, SockKind::Tcp),
-                Peer::Unix(..) => (libc::AF_UNIX, SockKind::Unix),
+            let kind = match peer {
+                Peer::Tcp(_) => SockKind::Tcp,
+                Peer::Unix(..) => SockKind::Unix,
             };
-            let s1 = sys::socket(af, libc::SOCK_STREAM | libc::SOCK_NONBLOCK)?;
+            let s1 = match sock {
+                Some(s) => s,
+                None => sys::socket(peer.family(), libc::SOCK_STREAM | libc::SOCK_NONBLOCK)?,
+            };
 
             if kind == SockKind::Tcp {
                 if sys::setsockopt_int(s1.as_raw_fd(), libc::SOL_TCP, libc::TCP_QUICKACK, 1)
@@ -418,7 +446,7 @@ impl Conn {
             });
 
             if readlen < 0 && rerr != libc::EAGAIN {
-                debug!("conn {}: splicing from {} socket: {}", self.id, SIDE_STR[from],
+                debug!("conn {}: splicing from {} socket: {}", self.id, self.side(from),
                        io::Error::from_raw_os_error(rerr));
                 return Err(());
             }
@@ -457,7 +485,7 @@ impl Conn {
             });
 
             if written < 0 && werr != libc::EAGAIN {
-                debug!("conn {}: splicing to {} socket: {}", self.id, SIDE_STR[to],
+                debug!("conn {}: splicing to {} socket: {}", self.id, self.side(to),
                        io::Error::from_raw_os_error(werr));
                 return Err(());
             }
@@ -488,7 +516,7 @@ impl Conn {
         // We need write-side wakeups if and only if we have data in the pipe
         // to drain.  We can't get them once the target side hung up.
         if self.pending[from] != 0 && self.hup[to] {
-            debug!("conn {}: {} socket hung up with data pending", self.id, SIDE_STR[to]);
+            debug!("conn {}: {} socket hung up with data pending", self.id, self.side(to));
             return Err(());
         }
         if self.pending[from] != 0 {
@@ -502,7 +530,7 @@ impl Conn {
         {
             // SAFETY: shutdown() has no memory safety preconditions
             if let Err(e) = cvt(unsafe { libc::shutdown(dst, libc::SHUT_WR) }) {
-                debug!("conn {}: shutdown() on {} socket: {e}", self.id, SIDE_STR[to]);
+                debug!("conn {}: shutdown() on {} socket: {e}", self.id, self.side(to));
                 return Err(());
             }
             self.set_event(ep, fin_sent(to));
@@ -537,7 +565,7 @@ impl Conn {
         if events & libc::EPOLLERR as u32 != 0 {
             match sys::so_error(self.fd(sidei)) {
                 Ok(err) => debug!("conn {}: error event on {} socket: {}", self.id,
-                                  SIDE_STR[sidei], io::Error::from_raw_os_error(err)),
+                                  self.side(sidei), io::Error::from_raw_os_error(err)),
                 Err(e) => debug!("conn {}: error retrieving SO_ERROR: {e}", self.id),
             }
             return self.rst(ep);
@@ -573,13 +601,13 @@ impl Conn {
         if events & libc::EPOLLHUP as u32 != 0 && !self.hup[sidei] {
             if self.events & out_wait(sidei) != 0 {
                 debug!("conn {}: hangup from {} socket with data pending", self.id,
-                       SIDE_STR[sidei]);
+                       self.side(sidei));
                 return self.rst(ep);
             }
 
             // Anything left to read from it is drained on EPOLLOUT from the
             // other side, see Theory of Operation
-            debug!("conn {}: hangup from {} socket", self.id, SIDE_STR[sidei]);
+            debug!("conn {}: hangup from {} socket", self.id, self.side(sidei));
             self.hup[sidei] = true;
             ep.delete(self.fd(sidei));
         }

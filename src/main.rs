@@ -6,12 +6,13 @@
 //! network namespaces where only the loopback interface exists, and forward
 //! selected TCP ports in there to TCP ports or Unix domain sockets on the
 //! host, moving data with splice() only, and selected UDP ports to UDP ports
-//! on the host.
+//! on the host, and selected TCP ports on the host to ports in there.
 
 mod config;
 mod epoll;
 mod fdpass;
 mod log;
+mod ns;
 mod sandbox;
 mod splice;
 mod sys;
@@ -25,6 +26,7 @@ use std::time::{Duration, Instant};
 use config::{Config, Proto, Target};
 use epoll::{Epoll, Ref};
 use log::{debug, info};
+use ns::NsSockets;
 use sandbox::{Listener, Sandbox};
 use splice::{Conn, Peer, PipePool};
 use udp::Udp;
@@ -74,6 +76,8 @@ struct Forwarder {
     retries: Vec<Retry>,
     nconns: usize,
     udp: Udp,
+    /// Sockets in the namespace, for inbound forwarding
+    ns: Option<NsSockets>,
     /// Descriptors available for connections and flows
     fd_budget: usize,
     /// TCP listening sockets were removed from epoll, see pause()
@@ -176,7 +180,7 @@ impl Forwarder {
             });
             self.nconns += 1;
 
-            let mut conn = Conn::new(id, li, s);
+            let mut conn = Conn::new(id, li, s, self.listeners[li].inbound);
 
             match peer(&self.targets[li], &conn) {
                 Ok(Some(peer)) => {
@@ -196,10 +200,21 @@ impl Forwarder {
 
     /// Connect connection @id to @peer for listener @fwd, or queue a retry
     fn connect(&mut self, id: usize, fwd: usize, peer: Peer, mut retry: Option<Retry>) {
+        // Inbound: connect from the namespace, unless we're already trying
+        let sock = match &mut self.ns {
+            Some(ns) if self.listeners[fwd].inbound && retry.is_none() => {
+                match ns.take(Proto::Tcp, peer.family() == libc::AF_INET6) {
+                    Ok(s) => Some(s),
+                    Err(e) => return self.connect_failed(id, e),
+                }
+            }
+            _ => None,
+        };
+
         let target = &self.targets[fwd];
         let Some(conn) = self.conns[id].as_mut() else { return };
 
-        match conn.connect(&self.ep, &mut self.pool, &peer) {
+        match conn.connect(&self.ep, &mut self.pool, &peer, sock) {
             Ok(true) => {}
             Ok(false) => {
                 let now = Instant::now();
@@ -241,6 +256,7 @@ impl Forwarder {
             Target::Host { addrs, .. } => addrs[conn.attempt()].to_string(),
             _ => target.to_string(),
         };
+        let side = if conn.inbound() { " in namespace" } else { "" };
 
         conn.connect_reset(&self.ep);
         match peer(target, conn) {
@@ -249,7 +265,7 @@ impl Forwarder {
                 self.connect(id, fwd, next, None);
             }
             Ok(None) | Err(_) => {
-                info!("conn {id}: cannot connect to {target}: {e}");
+                info!("conn {id}: cannot connect to {target}{side}: {e}");
                 conn.rst(&self.ep);
                 self.defer.push(id);
             }
@@ -296,6 +312,9 @@ impl Forwarder {
             }
         }
         self.pool.refill();
+        if let Some(ns) = &mut self.ns {
+            ns.refill();
+        }
         self.resume();
     }
 }
@@ -315,9 +334,8 @@ fn peer(target: &Target, conn: &Conn) -> std::io::Result<Option<Peer>> {
         }
         Target::Ip { addr: Some(addr), port } => Peer::Tcp(SocketAddr::new(*addr, *port)),
         Target::Ip { addr: None, port } => {
-            // Same (loopback) address as the one connected to in the namespace
             let local = sys::local_addr(conn.fd(0))?;
-            Peer::Tcp(SocketAddr::new(local.ip(), *port))
+            Peer::Tcp(SocketAddr::new(config::auto_addr(local.ip()), *port))
         }
         Target::Host { addrs, .. } => match addrs.get(conn.attempt()) {
             Some(a) => Peer::Tcp(*a),
@@ -326,9 +344,10 @@ fn peer(target: &Target, conn: &Conn) -> std::io::Result<Option<Peer>> {
     };
 
     if conn.attempt() == 0 {
+        let (id, side) = (conn.id(), if conn.inbound() { " in namespace" } else { "" });
         match &peer {
-            Peer::Tcp(a) => debug!("conn {}: accepted, connecting to {a}", conn.id()),
-            Peer::Unix(..) => debug!("conn {}: accepted, connecting to {target}", conn.id()),
+            Peer::Tcp(a) => debug!("conn {id}: accepted, connecting to {a}{side}"),
+            Peer::Unix(..) => debug!("conn {id}: accepted, connecting to {target}{side}"),
         }
     }
     Ok(Some(peer))
@@ -336,29 +355,53 @@ fn peer(target: &Target, conn: &Conn) -> std::io::Result<Option<Peer>> {
 
 
 fn run(mut cfg: Config) -> Result<u8, String> {
-    if cfg.forwards.iter().any(|f| f.inbound) {
-        return Err("forwarding from the host (-t, -u) isn't implemented yet".into());
+    if cfg.forwards.iter().any(|f| f.inbound && f.proto == Proto::Udp) {
+        return Err("UDP forwarding from the host (-u) isn't implemented yet".into());
     }
     cfg.resolve()?;
 
-    // One socket in the namespace per forwarded port
-    let (ports, targets): (Vec<_>, Vec<_>) = cfg.forwards.iter()
+    // One socket per forwarded port: in the namespace, then on the host
+    let (outbound, inbound): (Vec<_>, Vec<_>) = cfg.forwards.iter().partition(|f| !f.inbound);
+    let (ports, mut targets): (Vec<_>, Vec<_>) = outbound.iter()
         .flat_map(|f| f.ports().map(move |(port, target)| ((f.proto, port), target)))
         .unzip();
+    let nhost: usize = inbound.iter().map(|f| usize::from(f.last - f.first) + 1).sum();
+    let reserved = RESERVED_FDS + if nhost > 0 { ns::MAX_FDS } else { 0 };
 
     let (nofile_orig, nofile) = sys::raise_nofile()
         .map_err(|e| format!("cannot get file descriptor limit: {e}"))?;
-    if ports.len() + RESERVED_FDS > nofile {
+    if ports.len() + nhost + reserved > nofile {
         return Err(format!("too many forwarded ports ({}) for the open file limit ({nofile})",
-                           ports.len()));
+                           ports.len() + nhost));
     }
 
-    let Sandbox { pid, pidfd, listeners } = sandbox::spawn(&cfg.command, &ports, cfg.root, &nofile_orig)
-        .map_err(|e| format!("cannot start sandbox: {e}"))?;
+    // Before starting the command: fail early if a port is taken
+    let mut host = Vec::with_capacity(nhost);
+    for f in &inbound {
+        for (port, target) in f.ports() {
+            let l = sandbox::listen_host(f.proto, &f.bind, port).map_err(|e| {
+                let hint = if e.raw_os_error() == Some(libc::EACCES) && port < 1024 {
+                    " (see ip_unprivileged_port_start in sysctl net.ipv4)"
+                } else {
+                    ""
+                };
+                format!("cannot listen on {} port {port} at {} on the host: {e}{hint}",
+                        f.proto.name(), f.bind)
+            })?;
+            host.push(l);
+            targets.push(target);
+        }
+    }
+
+    let Sandbox { pid, pidfd, mut listeners, netns } =
+        sandbox::spawn(&cfg.command, &ports, cfg.root, &nofile_orig, nhost > 0)
+            .map_err(|e| format!("cannot start sandbox: {e}"))?;
+    listeners.extend(host);
 
     // The command has its copies of whatever we inherited: drop ours
     let keep: Vec<_> = listeners.iter().map(|l| l.fd.as_raw_fd())
         .chain([pidfd.as_raw_fd()])
+        .chain(netns.as_ref().map(|n| n.as_raw_fd()))
         .collect();
     match sys::drop_inherited(&keep) {
         // close_range() needs Linux 5.9: carry on, as pasta does
@@ -383,14 +426,17 @@ fn run(mut cfg: Config) -> Result<u8, String> {
         ep.add(l.fd.as_raw_fd(), libc::EPOLLIN as u32, Ref::Listener(i))
             .map_err(|e| format!("epoll_ctl(): {e}"))?;
     }
-    if let Some(l) = listeners.first() {
+    if let Some(l) = listeners.iter().find(|l| !l.inbound) {
         let any = if l.addr.is_ipv6() { "[::]" } else { "0.0.0.0" };
-        for f in &cfg.forwards {
+        for f in &outbound {
             debug!("forwarding {f}, from {any} (lo)");
         }
     }
+    for f in &inbound {
+        debug!("forwarding {f}, from {}", f.bind);
+    }
 
-    let fd_budget = nofile.saturating_sub(RESERVED_FDS + listeners.len());
+    let fd_budget = nofile.saturating_sub(reserved + listeners.len());
     debug!("maximum {} TCP connections, or {} UDP flows", (fd_budget / FDS_PER_CONN).max(1),
            (fd_budget / FDS_PER_FLOW).max(1));
 
@@ -405,6 +451,7 @@ fn run(mut cfg: Config) -> Result<u8, String> {
         retries: Vec::new(),
         nconns: 0,
         udp: Udp::new(),
+        ns: netns.map(NsSockets::new),
         fd_budget,
         paused: false,
     };

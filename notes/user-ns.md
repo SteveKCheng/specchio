@@ -13,18 +13,19 @@ Contents:
 3. [Joining a user namespace is per process, and single-threaded only](#3-joining-a-user-namespace-is-per-process-and-single-threaded-only)
 4. [Isolation once specchio has joined](#4-isolation-once-specchio-has-joined)
 5. [Dropping fake root with a nested user namespace](#5-dropping-fake-root-with-a-nested-user-namespace)
-6. [Plan](#6-plan)
+6. [Implementation](#6-implementation)
 
 ---
 
-## 1. Where things stand
+## 1. Where things stood
 
-So far, specchio only forwards from the sandbox to the host, and the parent
-never enters any namespace: the child creates new user and network
-namespaces, creates all listening sockets in them, sends them to the parent
-over a `socketpair`, and `exec`s the command (`notes/pasta.md`, section 3,
-"Option B"). The parent stays in the outer user namespace, without
-capabilities, out of reach of the command.
+Before inbound forwarding, specchio only forwarded from the sandbox to the
+host, and the parent never entered any namespace: the child creates new user
+and network namespaces, creates all listening sockets in them, sends them to
+the parent over a `socketpair`, and `exec`s the command (`notes/pasta.md`,
+section 3, "Option B"). The parent stays in the outer user namespace, without
+capabilities, out of reach of the command. That's still the case without
+`-t`.
 
 Inbound forwarding needs a socket in the sandbox's network namespace for
 each connection, after the command has started, and a pool sent at startup
@@ -176,21 +177,37 @@ namespace then failed with `EPERM`. With `NS_GET_USERNS` on
 `NS_GET_PARENT` of the nested one), joined it as uid 0, and `setns()` into
 the network namespace worked.
 
-## 6. Plan
+## 6. Implementation
 
-For inbound forwarding, and only if any inbound forwarding is configured
-(otherwise specchio stays in its own user namespace, single-threaded, and
-dumpable, as now):
+Only if any inbound forwarding is configured (otherwise specchio stays in its
+own user namespace, single-threaded, and dumpable):
 
-1. The child sends a descriptor for its network namespace with the listening
-   sockets, before nesting a user namespace (if asked to drop root).
-2. specchio sets `PR_SET_DUMPABLE` to 0, gets the owning user namespace with
-   `NS_GET_USERNS`, and joins it with `setns()`, while still single-threaded.
-3. To create sockets in the sandbox, specchio starts a thread that
-   `setns()`s into its network namespace, creates them, and exits; the main
-   thread waits for it. The main thread never leaves the host's network
-   namespace, as it couldn't come back.
+1. specchio creates the listening sockets on the host before starting the
+   sandbox, so that a port in use is reported before the command runs.
+2. The child opens `/proc/self/ns/net` and sends it after the listening
+   sockets. Whether it has nested a user namespace by then doesn't matter, as
+   specchio finds the owning one from the network namespace.
+3. specchio sets `PR_SET_DUMPABLE` to 0, gets the owning user namespace with
+   `NS_GET_USERNS`, and joins it with `setns()`, while still single-threaded
+   (`ns::join()`). If anything fails, the child is killed.
+4. The child waits for a message from specchio before `exec`ing the command
+   (for outbound forwarding only, too), so the command never runs if specchio
+   couldn't set up.
+5. As `pasta` does (`tcp_sock_refill_ns()`), specchio keeps pools of
+   non-blocking sockets created in the sandbox's network namespace, by
+   protocol and IP version, each kind only once it's been needed: 32
+   sockets each, refilled when below 16, between batches of events, and
+   right away if a pool is empty when a connection needs a socket. A thread
+   creates them: it `setns()`s into the network namespace, creates the
+   sockets, and exits, and the main thread waits for it (`ns::NsSockets`).
+   After a failure to refill, specchio waits a second before trying again in
+   the background. The main thread never leaves the host's network
+   namespace, as it couldn't come back, and specchio is single-threaded
+   again once the thread is joined.
+6. An inbound connection takes a socket of the IP version of its target from
+   a pool, and `connect()`s it from the main thread: the socket stays in the
+   network namespace it was created in.
 
-The README's "How it works" and `notes/pasta.md` describe specchio as never
-entering a namespace: that stays true until inbound forwarding is
-implemented.
+Checked: with `--root`, the command (root in the user namespace specchio
+joined) gets `EPERM` from both `pidfd_getfd()` and `PTRACE_ATTACH` on
+specchio (a test in `tests/run.sh`).
