@@ -216,6 +216,13 @@ check "reader sees EOF when command closes standard output" sh -c "
 check "command runs with original IDs, without capabilities" sh -c "'${B}' -- sh -c '
 	test \$(id -u) = $(id -u) && test \$(id -g) = $(id -g) &&
 	grep -q \"^CapEff:[[:space:]]*0*\$\" /proc/self/status && ! ip link set lo down 2>/dev/null'"
+check "command can bind ports below 1024 and use ping sockets" "${B}" -- python3 -c '
+import socket
+socket.socket(socket.AF_INET).bind(("127.0.0.1", 80))
+socket.socket(socket.AF_INET6).bind(("::1", 443))
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_ICMP)
+s.settimeout(5); s.sendto(b"\x08\0\0\0\0\0\0\0", ("127.0.0.1", 0)); s.recv(100)
+socket.socket(socket.AF_INET6, socket.SOCK_DGRAM, socket.IPPROTO_ICMPV6)'
 check "--root: command runs as root" sh -c "'${B}' --root -- sh -c '
 	test \$(id -u) = 0 && ip link set lo down'"
 check "started as root: command stays root" unshare -r sh -c "'${B}' -- sh -c '

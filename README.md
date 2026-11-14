@@ -128,8 +128,6 @@ syntax, and lists, ranges and exclusions as for `-T`:
 - The listening sockets are created before the command starts: if a port is
   taken, or below `net.ipv4.ip_unprivileged_port_start`, specchio exits
   without running it.
-- Ports below 1024 in the namespace: by default, the command has no
-  capabilities, and can't listen on them. Use a higher port, or `--root`.
 - The target is always a loopback address in the namespace, as only `lo`
   exists there. For spliced connections, `pasta` connects to the namespace's
   address on its other interface instead, unless `--host-lo-to-ns-lo` is
@@ -167,10 +165,23 @@ the new user namespace instead, with all capabilities there: it can configure
 the network namespace, but gains no privileges outside it. If specchio is
 started as root (in whatever user namespace), the command stays root.
 
+Either way, the command can listen on ports below 1024, and use `ping`, in
+the namespace: specchio sets `net.ipv4.ip_unprivileged_port_start` to 0, and
+`net.ipv4.ping_group_range` to the original group ID, there. These settings
+belong to the network namespace, so they change nothing on the host, and
+they don't protect anything in a namespace that only has `lo` and the
+command's own processes; without them, servers and network debugging fail
+for no good reason. (Giving the command `CAP_NET_BIND_SERVICE` instead
+wouldn't work: capabilities in its nested user namespace don't apply to the
+network namespace, which is owned by the parent one.) Whether specchio can
+listen on such a port on the host, for `-t` or `-u`, is up to the host's
+settings, as for any other process.
+
 ## How it works
 
 1. **Child (`sandbox.rs`)**: `unshare(CLONE_NEWUSER | CLONE_NEWNET)`, maps the
-   original UID/GID to root (a fixed one-line map), brings `lo` up, and
+   original UID/GID to root (a fixed one-line map), brings `lo` up, sets
+   `ip_unprivileged_port_start` and `ping_group_range` in the namespace, and
    creates a listening (TCP) or receiving (UDP) socket for each port forwarded
    from the namespace. Unless `--root` is given, it then creates a nested user
    namespace, mapping the original UID/GID to root of the first one, so that

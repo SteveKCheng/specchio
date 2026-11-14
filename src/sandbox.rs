@@ -10,7 +10,8 @@
 //! 1. unshare() new user and network namespaces, and map the original UID and
 //!    GID to root, so that the child gets CAP_NET_ADMIN over the new network
 //!    namespace
-//! 2. bring up the loopback interface
+//! 2. bring up the loopback interface, and let unprivileged processes bind
+//!    any port and use ping sockets in the namespace
 //! 3. create the listening sockets (TCP) and receiving sockets (UDP) for all
 //!    forwarded ports
 //! 4. unless asked to keep root, unshare() a nested user namespace mapping the
@@ -34,6 +35,7 @@ use std::os::unix::ffi::OsStrExt;
 
 use crate::config::{Bind, Proto};
 use crate::fdpass;
+use crate::log::info;
 use crate::sys::{self, cvt};
 
 /// Message tags on the setup channel
@@ -250,6 +252,18 @@ fn child_setup(uid: libc::uid_t, gid: libc::gid_t, ppid: libc::pid_t,
     }
 
     loopback_up().map_err(|e| format!("cannot bring up loopback interface: {e}"))?;
+
+    // Ports below 1024 and ping sockets need no privileges in here: the
+    // command wouldn't have them otherwise.  These settings are per network
+    // namespace, and we're root in the user namespace owning it.  As kernel
+    // group IDs, "0 0" is the original group ID: the only one mapped here.
+    // Losing them isn't worth failing for, as on kernels without them
+    for (path, value) in [("/proc/sys/net/ipv4/ip_unprivileged_port_start", "0"),
+                          ("/proc/sys/net/ipv4/ping_group_range", "0 0")] {
+        if let Err(e) = write_proc(path, value) {
+            info!("cannot write {path} in namespace: {e}");
+        }
+    }
 
     let mut fds: Vec<OwnedFd> = ports.iter()
         .map(|&(proto, port)| listen(proto, port).map_err(|e| {

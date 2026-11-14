@@ -157,6 +157,21 @@ Tested: the command ran with the original user and group IDs, `CapPrm` and
 permitted". The parent death signal (`PR_GET_PDEATHSIG`) was unaffected by
 the nested `unshare()` and the map writes.
 
+Without capabilities, the command can't listen on ports below 1024 or use
+ping sockets either. Keeping `CAP_NET_BIND_SERVICE` across `exec()` as an
+ambient capability doesn't help: tested with `unshare --keep-caps`, the
+command had all capabilities in the nested user namespace, and `bind()` to
+port 80 still failed with `EACCES`. The check is against the user namespace
+owning the network namespace, the parent of the nested one, and
+capabilities never apply to ancestor user namespaces. Instead, the child,
+root in the owning user namespace, sets the per-namespace sysctls
+`net.ipv4.ip_unprivileged_port_start` to 0 and `net.ipv4.ping_group_range`
+to "0 0" before nesting (tested: binding port 80 and `ping` over IPv4 and
+IPv6 then work in the nested namespace, and the host's values don't change).
+The range is stored as kernel group IDs, so "0 0", written as root of the
+sandbox's user namespace, is the original group ID, and reads as such from
+the nested one. Both settings cover IPv6 too.
+
 The one interaction with inbound forwarding: specchio must join the
 sandbox's user namespace, the one that owns the network namespace, not the
 nested one. Being in the nested one gives no capabilities over the network

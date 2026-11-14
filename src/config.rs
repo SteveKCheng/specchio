@@ -76,7 +76,7 @@ Examples:
   specchio -T 8080,8443 -T 5432:192.0.2.1/5433 -- my-agent
   specchio -T 2222:build.lan/22 -- ssh -p 2222 127.0.0.1
   specchio -T 8000-8099,~8080 -U 53:127.0.0.53 -- my-agent
-  specchio -t 127.0.0.1/8080:8000 -- python3 -m http.server 8000
+  specchio -t 127.0.0.1/8080:80 -- python3 -m http.server 80
 ";
 
 /// Host side Unix domain socket to connect to
