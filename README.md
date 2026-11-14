@@ -207,6 +207,36 @@ network namespace, which is owned by the parent one.) Whether specchio can
 listen on such a port on the host, for `-t` or `-u`, is up to the host's
 settings, as for any other process.
 
+### Attaching to an existing network namespace
+
+```sh
+specchio --netns /run/user/1000/netns/my-ns -T 3128:/run/user/1000/proxy.sock -t 8080
+```
+
+With `--netns PATH` (or `--netns NAME`, for `/run/netns/NAME`), specchio
+runs no command, and forwards ports from and to an existing network
+namespace instead, with the same options. It runs until it's terminated,
+even once no process is left in the namespace: its sockets keep the
+namespace alive, and it can't tell whether anything will use it again. Tie
+its lifetime to whatever owns the namespace, with a systemd unit, for
+example. (`pasta` instead watches the namespace's directory with inotify,
+and exits when the namespace's file is deleted.)
+
+- specchio joins the user namespace that owns the network namespace, which
+  it finds by itself (`NS_GET_USERNS`), unless it's already in it. So it
+  works with namespaces of sandboxes run by the same user, including
+  specchio's own. `pasta` needs `--userns` for that, and for a PID, joins
+  that process's user namespace, which isn't the right one for the command
+  of a specchio sandbox, as it runs in a nested user namespace. A network
+  namespace owned by a user namespace above specchio's, such as the host's,
+  is out of reach: specchio has no privileges there.
+- As `pasta` does, specchio brings up `lo` in the namespace, which is
+  harmless if it's already up, and needed for forwarding (`unshare -n`
+  leaves it down). It changes nothing else there: the settings for ports
+  below 1024 and `ping` (see above) are left alone.
+- `--root`, and a command, aren't allowed with `--netns`. Signals aren't
+  forwarded, as there's no command: `SIGTERM` stops specchio.
+
 ## How it works
 
 1. **Child (`sandbox.rs`)**: `unshare(CLONE_NEWUSER | CLONE_NEWNET)`, maps the
@@ -248,6 +278,10 @@ settings, as for any other process.
    `setns()`. The main thread never leaves the host's network namespace. As
    it's not dumpable, the command can't `ptrace` it or take its descriptors,
    even as root in that user namespace. See `notes/user-ns.md`.
+   With `--netns`, there's no child: specchio opens the namespace, joins the
+   user namespace owning it in the same way, and creates the listening
+   sockets for outbound forwarding from such a thread too. Threads share
+   the descriptor table, so the sockets need no passing around.
 4. **UDP (`udp.rs`)**: datagrams from the namespace are read in batches with
    `recvmmsg()`, along with their source address and their destination
    address (`IP_PKTINFO`/`IPV6_PKTINFO`), which identify the flow (in a hash

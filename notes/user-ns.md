@@ -8,12 +8,13 @@ unprivileged user. Source references to passt are as of `6aa4f88`.
 
 Contents:
 
-1. [Where things stand](#1-where-things-stand)
+1. [Where things stood](#1-where-things-stood)
 2. [Entering the sandbox's network namespace needs its user namespace](#2-entering-the-sandboxs-network-namespace-needs-its-user-namespace)
 3. [Joining a user namespace is per process, and single-threaded only](#3-joining-a-user-namespace-is-per-process-and-single-threaded-only)
 4. [Isolation once specchio has joined](#4-isolation-once-specchio-has-joined)
 5. [Dropping fake root with a nested user namespace](#5-dropping-fake-root-with-a-nested-user-namespace)
 6. [Implementation](#6-implementation)
+7. [Attaching to existing network namespaces (`--netns`)](#7-attaching-to-existing-network-namespaces---netns)
 
 ---
 
@@ -226,3 +227,25 @@ own user namespace, single-threaded, and dumpable):
 Checked: with `--root`, the command (root in the user namespace specchio
 joined) gets `EPERM` from both `pidfd_getfd()` and `PTRACE_ATTACH` on
 specchio (a test in `tests/run.sh`).
+
+## 7. Attaching to existing network namespaces (`--netns`)
+
+The same steps work for a network namespace specchio didn't create, without
+a child: open it, become non-dumpable, join the owning user namespace, and
+create sockets, the outbound listeners included, from a short-lived thread.
+Tested, with a Python prototype and then specchio:
+
+| Network namespace | Result |
+|---|---|
+| Of the command of a specchio sandbox (nested user namespace), by `/proc/PID/ns/net` | `NS_GET_USERNS` gives the sandbox's user namespace; joined as uid 0, listener created from a thread, and the command connected to it |
+| Owned by our own user namespace (`unshare -n` inside `unshare -Ur`) | `setns(CLONE_NEWUSER)` would fail with `EINVAL`; not joining, as we have the capabilities already, and entering it from a thread works |
+| Owned by an ancestor of our user namespace (the host's, from inside `unshare -Ur`) | `NS_GET_USERNS` fails with `EPERM` ("outside of the caller's namespace scope", `ioctl_ns(2)`), a clear error before anything else |
+| After the last process in it exited | Still alive, held by our descriptors: a thread could still enter it, connect, and our listener accepted |
+
+`pasta` joins `/proc/PID/ns/user` for a PID, which for a specchio sandbox
+is the nested user namespace: entering the network namespace would then
+fail with `EPERM` (section 5). For `--netns`, it joins no user namespace
+unless given `--userns`.
+
+As the namespace stays alive as long as specchio holds sockets in it,
+specchio can't tell when it's no longer used, and runs until terminated.

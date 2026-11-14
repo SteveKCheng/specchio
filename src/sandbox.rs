@@ -110,9 +110,7 @@ pub fn spawn(command: &[OsString], ports: &[(Proto, u16)], root: bool, nofile: &
             .collect::<io::Result<_>>()?;
 
         if let Some(netns) = &netns {
-            crate::ns::join(netns).map_err(|e| {
-                io::Error::new(e.kind(), format!("cannot join user namespace of sandbox: {e}"))
-            })?;
+            crate::ns::join(netns).map_err(io::Error::other)?;
         }
 
         // SAFETY: pidfd_open() has no memory safety preconditions.  The child
@@ -318,7 +316,7 @@ fn write_proc(path: &str, content: &str) -> io::Result<()> {
 }
 
 /// Set the IFF_UP flag on the loopback interface
-fn loopback_up() -> io::Result<()> {
+pub fn loopback_up() -> io::Result<()> {
     let s = sys::socket(libc::AF_INET, libc::SOCK_DGRAM)?;
     // SAFETY: All-zero is a valid ifreq
     let mut ifr: libc::ifreq = unsafe { zeroed() };
@@ -337,7 +335,7 @@ fn loopback_up() -> io::Result<()> {
 /// Create a non-blocking socket listening (TCP) or receiving (UDP) on @port,
 /// on the loopback interface, dual-stack if IPv6 is available, like pasta
 /// does for -T and -U
-fn listen(proto: Proto, port: u16) -> io::Result<OwnedFd> {
+pub fn listen(proto: Proto, port: u16) -> io::Result<OwnedFd> {
     listen_any(proto, port, Some("lo"))
 }
 

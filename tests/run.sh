@@ -291,6 +291,81 @@ check "SIGKILL to specchio kills the command" sh -c "
 	until [ -s '${TMP}/cmd.pid' ]; do sleep 0.05; done; sleep 0.2
 	kill -s KILL \${pid}; sleep 0.3; ! kill -0 \$(cat '${TMP}/cmd.pid') 2>/dev/null"
 
+# Start "unshare -Urn sh -c SCRIPT" in the background, as TPID, with its PID
+# in NSPID (as seen from here): a network namespace that specchio attaches to
+att_target() {
+	rm -f "${TMP}/tpid"
+	unshare -Urn sh -c 'echo $$ > "$0"; eval "$1"' "${TMP}/tpid" "$1" & TPID=$!
+	i=0; until [ -s "${TMP}/tpid" ]; do
+		i=$((i + 1)); [ ${i} -lt 200 ] || return 1; sleep 0.05
+	done
+	NSPID=$(cat "${TMP}/tpid")
+}
+
+# lo is down in a new network namespace: specchio brings it up
+att_both() {
+	rm -f "${TMP}/att.out"
+	# The server is the target itself, so that it can't outlive the test
+	att_target "{ i=0
+		until python3 '${TESTS}/tcp_client.py' 127.0.0.1 7000 >/dev/null 2>&1; do
+			i=\$((i + 1)); [ \${i} -lt 200 ] || exit 1; sleep 0.05
+		done
+		python3 '${TESTS}/tcp_client.py' 127.0.0.1 7000 > '${TMP}/att.out'; } &
+		exec python3 '${TESTS}/tcp_server.py' 0.0.0.0:8000 >/dev/null" || return 1
+	"${B}" --netns "/proc/${NSPID}/ns/net" -T 7000:18000 -t 28000:8000 & SPID=$!
+	r=0; i=0; until [ -s "${TMP}/att.out" ]; do
+		i=$((i + 1)); [ ${i} -lt 200 ] || { r=1; break; }; sleep 0.05
+	done
+	out="$(python3 "${TESTS}/tcp_client.py" 127.0.0.1 28000 2>&1)"
+	kill "${TPID}"; wait "${TPID}" || :
+	# Still running without the target: until terminated
+	sleep 0.3; kill -0 "${SPID}" || { echo "specchio exited"; r=1; }
+	kill "${SPID}"; wait "${SPID}" || :
+	[ "$(cat "${TMP}/att.out")" = "127.0.0.1 18000" ] || { echo "out: $(cat "${TMP}/att.out")"; r=1; }
+	[ "${out}" = "127.0.0.1 8000" ] || { echo "in: ${out}"; r=1; }
+	return ${r}
+}
+check "--netns: forwarding in both directions, until terminated" att_both
+
+# The command of a specchio sandbox is in a nested user namespace: specchio
+# joins the one owning the network namespace
+att_sandbox() {
+	"${B}" -- sh -c 'echo $$ > "$0"; exec python3 "$1" 0.0.0.0:8000' "${TMP}/tpid" \
+		"${TESTS}/tcp_server.py" >/dev/null & TPID=$!
+	i=0; until [ -s "${TMP}/tpid" ]; do
+		i=$((i + 1)); [ ${i} -lt 200 ] || return 1; sleep 0.05
+	done
+	sleep 0.5
+	"${B}" --netns "/proc/$(cat "${TMP}/tpid")/ns/net" -t 28000:8000 & SPID=$!
+	sleep 0.5; out="$(python3 "${TESTS}/tcp_client.py" 127.0.0.1 28000 2>&1)"
+	kill "${SPID}" "${TPID}"; wait "${SPID}" "${TPID}" || :
+	[ "${out}" = "127.0.0.1 8000" ] || { echo "got: ${out}"; return 1; }
+}
+rm -f "${TMP}/tpid"
+check "--netns: namespace of another specchio sandbox" att_sandbox
+
+# Owned by our own user namespace: nothing to join
+check "--netns: owned by our own user namespace" unshare -Ur sh -c "
+	unshare -n sh -c 'ip link set lo up; exec sleep 30' & t=\$!; sleep 0.3
+	'${B}' -d --netns /proc/\${t}/ns/net -T 7000:18000 2>'${TMP}/err' & s=\$!; sleep 0.5
+	nsenter -t \${t} -n python3 '${TESTS}/tcp_client.py' 127.0.0.1 7000 >'${TMP}/out' 2>&1
+	kill \${s} \${t}; grep -q 'owned by our user namespace, not joining' '${TMP}/err' &&
+	grep -qx '127.0.0.1 18000' '${TMP}/out'"
+
+check "--netns: not a network namespace" sh -c "
+	! '${B}' --netns /proc/self/ns/user -T 7000 2>'${TMP}/err' &&
+	grep -q 'not a network namespace' '${TMP}/err' &&
+	! '${B}' --netns /dev/null -T 7000 2>'${TMP}/err' &&
+	grep -q 'not a network namespace' '${TMP}/err' &&
+	! '${B}' --netns specchio-nonexistent -T 7000 2>'${TMP}/err' &&
+	grep -q 'cannot open network namespace /run/netns/specchio-nonexistent' '${TMP}/err'"
+
+# Owned by an ancestor of our user namespace: we have no privileges there
+check "--netns: network namespace out of reach" unshare -Ur sh -c "
+	! '${B}' --netns /proc/self/fd/9 -T 7000 2>'${TMP}/err' 9</proc/self/ns/net &&
+	grep -q 'cannot get user namespace owning the network namespace' '${TMP}/err'" \
+	9</proc/self/ns/net
+
 check "exit status passed through" sh -c "'${B}' -- sh -c 'exit 7'; test \$? -eq 7"
 
 check "no descriptors leaked to command" sh -c "'${B}' -T 8000:'${TMP}/echo.sock' -U 53 \

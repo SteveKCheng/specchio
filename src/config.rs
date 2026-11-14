@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 pub const USAGE: &str = "\
 Usage: specchio [OPTION]... [--] [COMMAND [ARG]...]
+       specchio [OPTION]... --netns PATH|NAME
 
 Run COMMAND (default: $SHELL) in new user and network namespaces with only a
 loopback interface, forwarding TCP connections and UDP datagrams to chosen
@@ -66,6 +67,12 @@ Options:
                       (inbound), as with pasta(1).  SPEC as for -t
                       --tcp-ns, --udp-ns, --tcp-ports and --udp-ports are
                       pasta's names for these options
+      --netns PATH|NAME
+                      Instead of running COMMAND, forward ports from and to
+                      an existing network namespace, at PATH, or at
+                      /run/netns/NAME, joining the user namespace that owns
+                      it, and run until terminated.  Its loopback interface
+                      is brought up, nothing else is changed
       --root          Run COMMAND as root in the new user namespace, which
                       can configure the network namespace.  By default,
                       COMMAND runs with the user and group IDs specchio was
@@ -303,8 +310,14 @@ pub struct Config {
     /// Keep the command root in the sandbox's user namespace
     pub root: bool,
     pub debug: bool,
+    /// Attach to this network namespace instead of running a command
+    pub netns: Option<PathBuf>,
+    /// Command to run, empty if attaching to a network namespace
     pub command: Vec<OsString>,
 }
+
+/// Directory of named network namespaces, as with ip-netns(8) and pasta
+const NETNS_RUN_DIR: &str = "/run/netns";
 
 
 fn parse_port(s: &[u8]) -> Option<u16> {
@@ -596,11 +609,11 @@ impl PortOpt {
 ///
 /// Return: None if @arg isn't this option, its value otherwise, or an error if
 ///         the value is missing
-fn opt_value(arg: &[u8], short: u8, longs: &[&str], args: &mut impl Iterator<Item = OsString>)
-             -> Option<Result<Vec<u8>, String>> {
+fn opt_value(arg: &[u8], short: Option<u8>, longs: &[&str],
+             args: &mut impl Iterator<Item = OsString>) -> Option<Result<Vec<u8>, String>> {
     let value = match arg {
-        [b'-', c] if *c == short => None,
-        [b'-', c, v @ ..] if *c == short => Some(v.to_vec()),
+        [b'-', c] if Some(*c) == short => None,
+        [b'-', c, v @ ..] if Some(*c) == short => Some(v.to_vec()),
         [b'-', b'-', rest @ ..] => longs.iter().find_map(|long| {
             match rest.strip_prefix(long.as_bytes())? {
                 [] => Some(None),
@@ -622,7 +635,7 @@ fn opt_value(arg: &[u8], short: u8, longs: &[&str], args: &mut impl Iterator<Ite
 fn port_opt(arg: &[u8], args: &mut impl Iterator<Item = OsString>)
             -> Option<Result<(PortOpt, Vec<u8>), String>> {
     PORT_OPTS.iter().find_map(|&(short, longs, opt)| {
-        opt_value(arg, short, &longs, args).map(|v| v.map(|v| (opt, v)))
+        opt_value(arg, Some(short), &longs, args).map(|v| v.map(|v| (opt, v)))
     })
 }
 
@@ -631,7 +644,7 @@ fn port_opt(arg: &[u8], args: &mut impl Iterator<Item = OsString>)
 /// Return: Ok(None) if the program should exit successfully (--help etc.)
 pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Config>, String> {
     let mut args = args.into_iter();
-    let mut cfg = Config { forwards: Vec::new(), root: false, debug: false,
+    let mut cfg = Config { forwards: Vec::new(), root: false, debug: false, netns: None,
                            command: Vec::new() };
 
     while let Some(arg) = args.next() {
@@ -648,6 +661,15 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Config>,
             }
             b"-d" | b"--debug" => cfg.debug = true,
             b"--root" => cfg.root = true,
+            _ if let Some(v) = opt_value(a, None, &["netns"], &mut args) => {
+                let v = PathBuf::from(OsString::from_vec(v?));
+                // A name, without '/', or a path, as in pasta
+                cfg.netns = Some(match v.as_os_str().as_bytes() {
+                    [] => return Err("empty --netns".into()),
+                    b if !b.contains(&b'/') => PathBuf::from(NETNS_RUN_DIR).join(v),
+                    _ => v,
+                });
+            }
             _ if let Some(r) = port_opt(a, &mut args) => {
                 let (opt, spec) = r?;
                 add_forwards(&mut cfg, opt, &spec)?;
@@ -663,7 +685,14 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Config>,
     }
     cfg.command.extend(args);
 
-    if cfg.command.is_empty() {
+    if cfg.netns.is_some() {
+        if !cfg.command.is_empty() {
+            return Err("both --netns and a command given".into());
+        }
+        if cfg.root {
+            return Err("--root is for running a command, not with --netns".into());
+        }
+    } else if cfg.command.is_empty() {
         cfg.command.push(std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into()));
     }
 
@@ -818,7 +847,8 @@ mod tests {
     fn resolve_localhost() {
         let mut forwards = fwds("8080:localhost/80,8081-8082:localhost/81-82");
         forwards.push(fwd("80:192.0.2.1"));
-        let mut cfg = Config { forwards, root: false, debug: false, command: Vec::new() };
+        let mut cfg = Config { forwards, root: false, debug: false, netns: None,
+                               command: Vec::new() };
         cfg.resolve().unwrap();
         let Target::Host { addrs, .. } = &cfg.forwards[0].target else { panic!() };
         assert!(!addrs.is_empty());
@@ -964,6 +994,22 @@ mod tests {
                 .contains("listening address not allowed for -T"));
         assert!(parse_forwards(Proto::Udp, true, b"53:/run/a").unwrap_err()
                 .contains("aren't supported for -u"));
+    }
+
+    #[test]
+    fn netns() {
+        let args = |a: &[&str]| parse(a.iter().map(OsString::from));
+        let cfg = args(&["--netns", "/proc/1/ns/net", "-T", "80"]).unwrap().unwrap();
+        assert_eq!(cfg.netns.unwrap(), PathBuf::from("/proc/1/ns/net"));
+        assert!(cfg.command.is_empty());
+        let cfg = args(&["--netns=ctr", "-t", "80"]).unwrap().unwrap();
+        assert_eq!(cfg.netns.unwrap(), PathBuf::from("/run/netns/ctr"));
+        let cfg = args(&["--netns", "./ns"]).unwrap().unwrap();
+        assert_eq!(cfg.netns.unwrap(), PathBuf::from("./ns"));
+        for bad in [&["--netns"][..], &["--netns="], &["--netns", "x", "true"],
+                    &["--netns", "x", "--", "true"], &["--root", "--netns", "x"], &["--netnsx"]] {
+            assert!(args(bad).is_err(), "{bad:?} should be invalid");
+        }
     }
 
     #[test]

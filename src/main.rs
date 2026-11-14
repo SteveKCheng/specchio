@@ -20,7 +20,7 @@ mod sys;
 mod udp;
 
 use std::net::SocketAddr;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
@@ -365,6 +365,56 @@ fn peer(target: &Target, conn: &Conn) -> std::io::Result<Option<Peer>> {
 }
 
 
+/// What specchio runs for
+enum Mode {
+    /// A command in a new sandbox: forward signals to it, exit with its status
+    Command { pid: libc::pid_t, pidfd: OwnedFd, sigfd: OwnedFd },
+    /// Attached to an existing network namespace: run until terminated
+    Attached,
+}
+
+impl Mode {
+    /// Descriptors to keep open
+    fn fds(&self) -> Vec<RawFd> {
+        match self {
+            Mode::Command { pidfd, sigfd, .. } => vec![pidfd.as_raw_fd(), sigfd.as_raw_fd()],
+            Mode::Attached => Vec::new(),
+        }
+    }
+}
+
+/// Attach to the network namespace at @path: join the user namespace owning
+/// it, bring up its loopback interface, and create a socket for each of
+/// @ports there, from a thread, as the sandbox child would
+///
+/// Return: listeners, and the namespace, if @inbound forwarding needs it
+fn attach(path: &std::path::Path, ports: &[(Proto, u16)], inbound: bool)
+          -> Result<(Vec<Listener>, Option<OwnedFd>), String> {
+    let p = path.display();
+    let netns: OwnedFd = std::fs::File::open(path)
+        .map_err(|e| format!("cannot open network namespace {p}: {e}"))?.into();
+    ns::join(&netns).map_err(|e| format!("{p}: {e}"))?;
+
+    let fds = ns::call(netns.as_fd(), || -> Result<Vec<OwnedFd>, String> {
+        // As pasta does: harmless if it's up already
+        sandbox::loopback_up().map_err(|e| format!("cannot bring up loopback interface: {e}"))?;
+        ports.iter()
+            .map(|&(proto, port)| sandbox::listen(proto, port).map_err(|e| {
+                format!("cannot listen on {} port {port} in namespace: {e}", proto.name())
+            }))
+            .collect()
+    }).map_err(|e| format!("cannot enter network namespace {p}: {e}"))??;
+    debug!("attached to network namespace {p}");
+
+    let listeners = fds.into_iter().zip(ports)
+        .map(|(fd, &(proto, _))| {
+            let addr = sys::local_addr(fd.as_raw_fd()).map_err(|e| format!("getsockname(): {e}"))?;
+            Ok(Listener { fd, addr, proto, inbound: false })
+        })
+        .collect::<Result<_, String>>()?;
+    Ok((listeners, inbound.then_some(netns)))
+}
+
 /// Forward pending signals from @sigfd to the command, at @pidfd, unless the
 /// kernel sent them (the terminal did, to the command too), see signals.rs
 fn forward_signals(sigfd: std::os::fd::RawFd, pidfd: std::os::fd::RawFd) {
@@ -418,18 +468,28 @@ fn run(mut cfg: Config) -> Result<u8, String> {
         }
     }
 
-    // Before fork(), so that no signal for the command is missed
-    let sigs = signals::block().map_err(|e| format!("cannot block signals: {e}"))?;
-
-    let Sandbox { pid, pidfd, mut listeners, netns } =
-        sandbox::spawn(&cfg.command, &ports, cfg.root, &nofile_orig, nhost > 0, &sigs.orig_mask)
-            .map_err(|e| format!("cannot start sandbox: {e}"))?;
-    let sigfd = sigs.fd().map_err(|e| format!("cannot create signalfd: {e}"))?;
+    let (mut listeners, netns, mode) = match &cfg.netns {
+        Some(path) => {
+            let (listeners, netns) = attach(path, &ports, nhost > 0)?;
+            (listeners, netns, Mode::Attached)
+        }
+        None => {
+            // Before fork(), so that no signal for the command is missed
+            let sigs = signals::block().map_err(|e| format!("cannot block signals: {e}"))?;
+            let Sandbox { pid, pidfd, listeners, netns } =
+                sandbox::spawn(&cfg.command, &ports, cfg.root, &nofile_orig, nhost > 0,
+                               &sigs.orig_mask)
+                    .map_err(|e| format!("cannot start sandbox: {e}"))?;
+            let sigfd = sigs.fd().map_err(|e| format!("cannot create signalfd: {e}"))?;
+            (listeners, netns, Mode::Command { pid, pidfd, sigfd })
+        }
+    };
     listeners.extend(host);
 
-    // The command has its copies of whatever we inherited: drop ours
+    // The command has its copies of whatever we inherited: drop ours.  With
+    // no command, they aren't needed either
     let keep: Vec<_> = listeners.iter().map(|l| l.fd.as_raw_fd())
-        .chain([pidfd.as_raw_fd(), sigfd.as_raw_fd()])
+        .chain(mode.fds())
         .chain(netns.as_ref().map(|n| n.as_raw_fd()))
         .collect();
     match sys::drop_inherited(&keep) {
@@ -441,10 +501,12 @@ fn run(mut cfg: Config) -> Result<u8, String> {
     }
 
     let ep = Epoll::new().map_err(|e| format!("cannot create epoll descriptor: {e}"))?;
-    ep.add(pidfd.as_raw_fd(), libc::EPOLLIN as u32, Ref::Child)
-        .map_err(|e| format!("epoll_ctl(): {e}"))?;
-    ep.add(sigfd.as_raw_fd(), libc::EPOLLIN as u32, Ref::Signal)
-        .map_err(|e| format!("epoll_ctl(): {e}"))?;
+    if let Mode::Command { pidfd, sigfd, .. } = &mode {
+        ep.add(pidfd.as_raw_fd(), libc::EPOLLIN as u32, Ref::Child)
+            .map_err(|e| format!("epoll_ctl(): {e}"))?;
+        ep.add(sigfd.as_raw_fd(), libc::EPOLLIN as u32, Ref::Signal)
+            .map_err(|e| format!("epoll_ctl(): {e}"))?;
+    }
     for (i, l) in listeners.iter().enumerate() {
         ep.add(l.fd.as_raw_fd(), libc::EPOLLIN as u32, Ref::Listener(i))
             .map_err(|e| format!("epoll_ctl(): {e}"))?;
@@ -488,16 +550,19 @@ fn run(mut cfg: Config) -> Result<u8, String> {
             .map_err(|e| format!("epoll_wait(): {e}"))?;
 
         for &(r, ev) in &events {
-            match r {
-                Ref::Child => {
-                    let code = sandbox::reap(pid);
+            match (r, &mode) {
+                (Ref::Child, Mode::Command { pid, .. }) => {
+                    let code = sandbox::reap(*pid);
                     debug!("command exited with status {code}");
                     return Ok(code as u8);
                 }
-                Ref::Signal => forward_signals(sigfd.as_raw_fd(), pidfd.as_raw_fd()),
-                Ref::Listener(i) => fwd.listener_event(i),
-                Ref::Conn(id, sidei) => fwd.conn_event(id, sidei, ev),
-                Ref::Flow(id) => fwd.flow_event(id),
+                (Ref::Signal, Mode::Command { pidfd, sigfd, .. }) => {
+                    forward_signals(sigfd.as_raw_fd(), pidfd.as_raw_fd());
+                }
+                (Ref::Child | Ref::Signal, _) => unreachable!("no command"),
+                (Ref::Listener(i), _) => fwd.listener_event(i),
+                (Ref::Conn(id, sidei), _) => fwd.conn_event(id, sidei, ev),
+                (Ref::Flow(id), _) => fwd.flow_event(id),
             }
         }
 

@@ -17,9 +17,13 @@
 //!   so only the short-lived thread enters it
 //! - we become non-dumpable first, so that the command, which can be root in
 //!   that user namespace, can't ptrace() us or take our descriptors
+//!
+//! The same applies to network namespaces we attach to (--netns), where the
+//! listening sockets for outbound forwarding are also created this way.
 
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::MetadataExt;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -27,8 +31,10 @@ use crate::config::Proto;
 use crate::log::debug;
 use crate::sys::{self, cvt};
 
-/// ioctl() to get the user namespace owning a namespace, see ioctl_ns(2)
+/// ioctl()s to get the user namespace owning a namespace, and the type of a
+/// namespace, see ioctl_ns(2)
 const NS_GET_USERNS: libc::c_ulong = 0xb701;
+const NS_GET_NSTYPE: libc::c_ulong = 0xb703;
 
 /// Sockets kept in each pool, and refill threshold
 const POOL_SIZE: usize = 32;
@@ -47,19 +53,64 @@ fn kind(proto: Proto, v6: bool) -> usize {
 }
 
 /// Join the user namespace owning network namespace @netns, so that threads
-/// can enter @netns later.  Must be called while single-threaded
-pub fn join(netns: &OwnedFd) -> io::Result<()> {
-    // Before joining: we'd be exposed to the command in the meantime
+/// can enter @netns later, unless it's ours already.  Must be called while
+/// single-threaded
+///
+/// Return: error with a description of the step that failed
+pub fn join(netns: &OwnedFd) -> Result<(), String> {
+    // SAFETY: NS_GET_NSTYPE takes no argument
+    match unsafe { libc::ioctl(netns.as_raw_fd(), NS_GET_NSTYPE) } {
+        t if t == libc::CLONE_NEWNET => {}
+        -1 if crate::sys::errno() != libc::ENOTTY => {
+            return Err(format!("cannot get namespace type: {}", io::Error::last_os_error()));
+        }
+        _ => return Err("not a network namespace".into()),
+    }
+
+    // Before joining: we'd be exposed to its processes in the meantime
     // SAFETY: prctl() with integer arguments
-    cvt(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) })?;
+    cvt(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) })
+        .map_err(|e| format!("cannot make process non-dumpable: {e}"))?;
 
     // SAFETY: NS_GET_USERNS takes no argument, and returns a new descriptor
-    let userns = cvt(unsafe { libc::ioctl(netns.as_raw_fd(), NS_GET_USERNS) })?;
+    let userns = cvt(unsafe { libc::ioctl(netns.as_raw_fd(), NS_GET_USERNS) }).map_err(|e| {
+        // EPERM: owned by an ancestor of our user namespace, or an unrelated one
+        format!("cannot get user namespace owning the network namespace: {e}")
+    })?;
     // SAFETY: userns was just returned by ioctl() and is owned by nobody else
-    let userns = unsafe { OwnedFd::from_raw_fd(userns) };
+    let userns = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(userns) });
+
+    // Joining the user namespace we're in fails with EINVAL, and isn't needed
+    let ours = std::fs::metadata("/proc/self/ns/user")
+        .map_err(|e| format!("cannot read /proc/self/ns/user: {e}"))?;
+    let theirs = userns.metadata().map_err(|e| format!("cannot stat user namespace: {e}"))?;
+    if (ours.dev(), ours.ino()) == (theirs.dev(), theirs.ino()) {
+        debug!("network namespace owned by our user namespace, not joining");
+        return Ok(());
+    }
 
     // SAFETY: setns() has no memory safety preconditions
-    cvt(unsafe { libc::setns(userns.as_raw_fd(), libc::CLONE_NEWUSER) }).map(drop)
+    cvt(unsafe { libc::setns(userns.as_raw_fd(), libc::CLONE_NEWUSER) })
+        .map(drop)
+        .map_err(|e| format!("cannot join user namespace owning the network namespace: {e}"))
+}
+
+/// Run @f in a short-lived thread in network namespace @netns, which join()
+/// has made enterable, and return its result
+pub fn call<T: Send>(netns: BorrowedFd, f: impl FnOnce() -> T + Send) -> io::Result<T> {
+    thread::scope(|s| {
+        thread::Builder::new()
+            .name("specchio-ns".into())
+            .stack_size(THREAD_STACK)
+            .spawn_scoped(s, || {
+                // SAFETY: setns() has no memory safety preconditions, and only
+                // affects this thread, which is about to exit
+                cvt(unsafe { libc::setns(netns.as_raw_fd(), libc::CLONE_NEWNET) })?;
+                Ok(f())
+            })?
+            .join()
+            .unwrap_or_else(|_| Err(io::Error::other("thread panicked")))
+    })
 }
 
 /// Pools of sockets created in the sandbox's network namespace
@@ -120,17 +171,7 @@ impl NsSockets {
         let need: Vec<(usize, usize)> = kinds.iter()
             .map(|&k| (k, POOL_SIZE - self.pools[k].len()))
             .collect();
-        let netns = self.netns.as_fd();
-
-        let made = thread::scope(|s| {
-            thread::Builder::new()
-                .name("specchio-ns".into())
-                .stack_size(THREAD_STACK)
-                .spawn_scoped(s, || create(netns, &need))
-                .map(|t| t.join().unwrap_or_else(|_| Err(io::Error::other("thread panicked"))))
-        });
-
-        let made = match made.and_then(|r| r) {
+        let made = match call(self.netns.as_fd(), || create(&need)) {
             Ok(made) => made,
             Err(e) => {
                 let msg = e.to_string();
@@ -146,17 +187,11 @@ impl NsSockets {
     }
 }
 
-/// Body of the thread creating sockets: enter the network namespace
-/// @netns, create @need (kind, number) sockets
+/// Create @need (kind, number) sockets, in the thread run by call()
 ///
 /// Return: sockets for each kind, with the error that stopped us if any
-fn create(netns: BorrowedFd, need: &[(usize, usize)])
-          -> io::Result<Vec<(Vec<OwnedFd>, Option<io::Error>)>> {
-    // SAFETY: setns() has no memory safety preconditions, and only affects
-    // this thread, which is about to exit
-    cvt(unsafe { libc::setns(netns.as_raw_fd(), libc::CLONE_NEWNET) })?;
-
-    Ok(need.iter().map(|&(k, n)| {
+fn create(need: &[(usize, usize)]) -> Vec<(Vec<OwnedFd>, Option<io::Error>)> {
+    need.iter().map(|&(k, n)| {
         let af = if k & 1 != 0 { libc::AF_INET6 } else { libc::AF_INET };
         let ty = if k & 2 != 0 { libc::SOCK_DGRAM } else { libc::SOCK_STREAM };
         let mut socks = Vec::with_capacity(n);
@@ -167,5 +202,5 @@ fn create(netns: BorrowedFd, need: &[(usize, usize)])
             }
         }
         (socks, None)
-    }).collect())
+    }).collect()
 }
