@@ -18,9 +18,10 @@ ports in the namespace to ports or Unix domain sockets on the host, and from
 chosen ports on the host to ports in the namespace.
 
 Options:
-  -T, --tcp-ns SPEC   Forward TCP ports from the namespace to the host, as
-                      with pasta(1), connections to any loopback address in
-                      the namespace.  SPEC can be:
+  -T, --out-tcp SPEC, --tcp-ns SPEC
+                      Forward TCP ports from the namespace to the host
+                      (outbound), as with pasta(1), connections to any
+                      loopback address in the namespace.  SPEC can be:
                         none          don't forward anything
                         a comma-separated list of:
                           PORTS[:TARGET]
@@ -40,12 +41,13 @@ Options:
                                       PORTS
                       TOPORTS is a port, or a range of the same length as
                       PORTS.  Can be given multiple times
-  -U, --udp-ns SPEC   Forward UDP ports from the namespace to the host, as
-                      with pasta(1).  SPEC as for -T, except that Unix domain
-                      socket targets aren't supported
-  -t, --tcp-ports SPEC
-                      Forward TCP ports from the host to the namespace, as
-                      with pasta(1).  SPEC can be:
+  -U, --out-udp SPEC, --udp-ns SPEC
+                      Forward UDP ports from the namespace to the host
+                      (outbound), as with pasta(1).  SPEC as for -T, except
+                      that Unix domain socket targets aren't supported
+  -t, --in-tcp SPEC, --tcp-ports SPEC
+                      Forward TCP ports from the host to the namespace
+                      (inbound), as with pasta(1).  SPEC can be:
                         none          don't forward anything
                         [ADDR][%IFNAME]/LIST
                         LIST          listen on host address ADDR (default:
@@ -59,9 +61,11 @@ Options:
                         TOADDR[/TOPORTS]
                                       IP address in the namespace
                       Can be given multiple times
-  -u, --udp-ports SPEC
-                      Forward UDP ports from the host to the namespace, as
-                      with pasta(1).  SPEC as for -t
+  -u, --in-udp SPEC, --udp-ports SPEC
+                      Forward UDP ports from the host to the namespace
+                      (inbound), as with pasta(1).  SPEC as for -t
+                      --tcp-ns, --udp-ns, --tcp-ports and --udp-ports are
+                      pasta's names for these options
       --root          Run COMMAND as root in the new user namespace, which
                       can configure the network namespace.  By default,
                       COMMAND runs with the user and group IDs specchio was
@@ -566,11 +570,12 @@ enum PortOpt {
     UdpNs,
 }
 
-const PORT_OPTS: [(u8, &str, PortOpt); 4] = [
-    (b'T', "tcp-ns", PortOpt::TcpNs),
-    (b't', "tcp-ports", PortOpt::TcpPorts),
-    (b'u', "udp-ports", PortOpt::UdpPorts),
-    (b'U', "udp-ns", PortOpt::UdpNs),
+/// Short option, long options: ours, then pasta's
+const PORT_OPTS: [(u8, [&str; 2], PortOpt); 4] = [
+    (b'T', ["out-tcp", "tcp-ns"], PortOpt::TcpNs),
+    (b't', ["in-tcp", "tcp-ports"], PortOpt::TcpPorts),
+    (b'u', ["in-udp", "udp-ports"], PortOpt::UdpPorts),
+    (b'U', ["out-udp", "udp-ns"], PortOpt::UdpNs),
 ];
 
 impl PortOpt {
@@ -586,32 +591,38 @@ impl PortOpt {
 }
 
 /// Match @arg against an option with a value: -X VALUE, -XVALUE, --name VALUE
-/// or --name=VALUE, taking VALUE from @args if needed
+/// or --name=VALUE, for any of the names @longs, taking VALUE from @args if
+/// needed
 ///
 /// Return: None if @arg isn't this option, its value otherwise, or an error if
 ///         the value is missing
-fn opt_value(arg: &[u8], short: u8, long: &str, args: &mut impl Iterator<Item = OsString>)
+fn opt_value(arg: &[u8], short: u8, longs: &[&str], args: &mut impl Iterator<Item = OsString>)
              -> Option<Result<Vec<u8>, String>> {
     let value = match arg {
         [b'-', c] if *c == short => None,
         [b'-', c, v @ ..] if *c == short => Some(v.to_vec()),
-        [b'-', b'-', rest @ ..] if rest == long.as_bytes() => None,
-        [b'-', b'-', rest @ ..] if rest.starts_with(long.as_bytes())
-            && rest.get(long.len()) == Some(&b'=') => Some(rest[long.len() + 1..].to_vec()),
+        [b'-', b'-', rest @ ..] => longs.iter().find_map(|long| {
+            match rest.strip_prefix(long.as_bytes())? {
+                [] => Some(None),
+                [b'=', v @ ..] => Some(Some(v.to_vec())),
+                _ => None,
+            }
+        })?,
         _ => return None,
     };
     Some(match value {
         Some(v) => Ok(v),
-        None => args.next().map(|v| v.into_vec())
-            .ok_or_else(|| format!("option requires an argument: --{long}")),
+        None => args.next().map(|v| v.into_vec()).ok_or_else(|| {
+            format!("option requires an argument: {}", String::from_utf8_lossy(arg))
+        }),
     })
 }
 
 /// Match @arg against options taking a port specifier, see opt_value()
 fn port_opt(arg: &[u8], args: &mut impl Iterator<Item = OsString>)
             -> Option<Result<(PortOpt, Vec<u8>), String>> {
-    PORT_OPTS.iter().find_map(|&(short, long, opt)| {
-        opt_value(arg, short, long, args).map(|v| v.map(|v| (opt, v)))
+    PORT_OPTS.iter().find_map(|&(short, longs, opt)| {
+        opt_value(arg, short, &longs, args).map(|v| v.map(|v| (opt, v)))
     })
 }
 
@@ -953,6 +964,27 @@ mod tests {
                 .contains("listening address not allowed for -T"));
         assert!(parse_forwards(Proto::Udp, true, b"53:/run/a").unwrap_err()
                 .contains("aren't supported for -u"));
+    }
+
+    #[test]
+    fn long_names() {
+        let args = |a: &[&str]| parse(a.iter().map(OsString::from));
+        let cfg = args(&["--out-tcp", "80", "--out-udp=81", "--in-tcp=82", "--in-udp", "83",
+                         "--tcp-ns", "84", "--udp-ns=85", "--tcp-ports=86", "--udp-ports", "87",
+                         "true"]).unwrap().unwrap();
+        let rules: Vec<_> = cfg.forwards.iter().map(|f| (f.proto, f.inbound, f.first)).collect();
+        assert_eq!(rules, [(Proto::Tcp, false, 80), (Proto::Udp, false, 81), (Proto::Tcp, true, 82),
+                           (Proto::Udp, true, 83), (Proto::Tcp, false, 84), (Proto::Udp, false, 85),
+                           (Proto::Tcp, true, 86), (Proto::Udp, true, 87)]);
+        assert_eq!(cfg.command, ["true"]);
+        // Synonyms are the same option: "none" conflicts with earlier rules
+        assert!(args(&["--in-tcp", "80", "--tcp-ports=none"]).is_err());
+        assert!(args(&["-T", "80", "--out-tcp", "80"]).is_err());
+        for bad in [&["--in-tcpx=80"][..], &["--in-tc=80"], &["--out-tcp"], &["--in"]] {
+            assert!(args(bad).is_err(), "{bad:?} should be invalid");
+        }
+        let e = args(&["--in-udp"]).unwrap_err();
+        assert_eq!(e, "option requires an argument: --in-udp");
     }
 
     #[test]

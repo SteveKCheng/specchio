@@ -269,6 +269,8 @@ tin() {
 
 check "TCP in, same loopback address" tin "127.0.0.5 8000" 127.0.0.5 28000 -t 28000:8000
 check "TCP in, IPv6 loopback" tin "::1 8000" ::1 28000 -t 28000:8000
+check "TCP in and out, long option names" tin "127.0.0.1 8000" 127.0.0.1 28000 \
+	--in-tcp 28000:8000 --out-tcp=18000 --in-udp=28000 --out-udp 18000
 check "TCP in, listening address" tin "127.0.0.1 8000" 127.0.0.1 28000 \
 	-t 127.0.0.1/28000:8000
 check "TCP in, other address: refused on host" tin \

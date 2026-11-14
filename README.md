@@ -22,7 +22,13 @@ specchio -T 3128:/run/user/1000/proxy.sock -- \
 specchio only isolates the network: for the filesystem and the rest, nest
 `bwrap` or similar inside it (`specchio ... -- bwrap ... -- agent ...`).
 
-### `-T`, `--tcp-ns`
+Outbound (`--out-*`) forwarding goes from the namespace to the host, and
+inbound (`--in-*`) forwarding from the host to the namespace. The short
+options, and the long ones in parentheses, are `pasta`'s, which name the
+side the ports are on: `--tcp-ns` forwards ports in the namespace,
+outbound, and `--tcp-ports` ports on the host, inbound.
+
+### `-T`, `--out-tcp` (`--tcp-ns`)
 
 This uses `pasta`'s syntax; `-T` can be repeated:
 
@@ -44,7 +50,7 @@ As in `pasta`, `-T none` is an error after other `-T` options, but not
 before them, and a port can't be forwarded twice. `pasta` command lines like
 `pasta -t none -u none -U none -T 8080 -- ...` work unchanged.
 
-### `-U`, `--udp-ns`
+### `-U`, `--out-udp` (`--udp-ns`)
 
 The same syntax as `-T`, for UDP, except that Unix domain socket targets
 aren't supported. `-U` and `-T` can forward the same port. As in `pasta`, a
@@ -104,7 +110,7 @@ Compared to `pasta`:
   Without such a prefix, `proxy.sock` is a host name: if resolving it fails
   and a file of that name exists, the error message suggests `./proxy.sock`.
 
-### `-t`, `--tcp-ports`
+### `-t`, `--in-tcp` (`--tcp-ports`)
 
 Forwards TCP ports on the host to ports in the namespace, also with `pasta`'s
 syntax, and lists, ranges and exclusions as for `-T`:
@@ -139,7 +145,7 @@ syntax, and lists, ranges and exclusions as for `-T`:
   namespace, from a port the kernel picks, as with `pasta`'s spliced
   connections.
 
-### `-u`, `--udp-ports`
+### `-u`, `--in-udp` (`--udp-ports`)
 
 The same syntax as `-t`, for UDP. Flows work as for `-U`, the other way
 around: each flow, from a client address and port on the host, gets a socket
