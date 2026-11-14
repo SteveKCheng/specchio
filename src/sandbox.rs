@@ -113,14 +113,8 @@ pub fn spawn(command: &[OsString], ports: &[(Proto, u16)], root: bool, nofile: &
             crate::ns::join(netns).map_err(io::Error::other)?;
         }
 
-        // SAFETY: pidfd_open() has no memory safety preconditions.  The child
-        // is not reaped yet, so the PID can't be reused.
-        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-        if pidfd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: pidfd was just created and is owned by nobody else
-        let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd as RawFd) };
+        // The child is not reaped yet, so the PID can't be reused
+        let pidfd = sys::pidfd_open(pid)?;
 
         fdpass::send(ours.as_fd(), &[MSG_OK], &[])?;
         Ok(Sandbox { pid, pidfd, listeners, netns })

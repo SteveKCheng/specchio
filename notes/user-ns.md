@@ -249,3 +249,5 @@ unless given `--userns`.
 
 As the namespace stays alive as long as specchio holds sockets in it,
 specchio can't tell when it's no longer used, and runs until terminated.
+Attached by PID instead, it watches the process with a pidfd, opened before
+`/proc/PID/ns/net` and checked afterwards, and exits when the process does.

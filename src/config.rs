@@ -12,6 +12,7 @@ use std::path::PathBuf;
 pub const USAGE: &str = "\
 Usage: specchio [OPTION]... [--] [COMMAND [ARG]...]
        specchio [OPTION]... --netns PATH|NAME
+       specchio [OPTION]... [--] PID
 
 Run COMMAND (default: $SHELL) in new user and network namespaces with only a
 loopback interface, forwarding TCP connections and UDP datagrams to chosen
@@ -72,7 +73,9 @@ Options:
                       an existing network namespace, at PATH, or at
                       /run/netns/NAME, joining the user namespace that owns
                       it, and run until terminated.  Its loopback interface
-                      is brought up, nothing else is changed
+                      is brought up, nothing else is changed.  With PID
+                      instead of COMMAND, the same for the network namespace
+                      of process PID, until it exits
       --root          Run COMMAND as root in the new user namespace, which
                       can configure the network namespace.  By default,
                       COMMAND runs with the user and group IDs specchio was
@@ -312,6 +315,8 @@ pub struct Config {
     pub debug: bool,
     /// Attach to this network namespace instead of running a command
     pub netns: Option<PathBuf>,
+    /// Attach to the network namespace of this process, until it exits
+    pub pid: Option<libc::pid_t>,
     /// Command to run, empty if attaching to a network namespace
     pub command: Vec<OsString>,
 }
@@ -644,7 +649,7 @@ fn port_opt(arg: &[u8], args: &mut impl Iterator<Item = OsString>)
 /// Return: Ok(None) if the program should exit successfully (--help etc.)
 pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Config>, String> {
     let mut args = args.into_iter();
-    let mut cfg = Config { forwards: Vec::new(), root: false, debug: false, netns: None,
+    let mut cfg = Config { forwards: Vec::new(), root: false, debug: false, netns: None, pid: None,
                            command: Vec::new() };
 
     while let Some(arg) = args.next() {
@@ -685,12 +690,27 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Config>,
     }
     cfg.command.extend(args);
 
-    if cfg.netns.is_some() {
+    // A lone number is a PID, as in pasta
+    if let [arg] = cfg.command.as_slice()
+        && let a = arg.as_bytes()
+        && !a.is_empty() && a.iter().all(u8::is_ascii_digit)
+    {
+        let pid = std::str::from_utf8(a).ok().and_then(|p| p.parse().ok())
+            .filter(|&p: &libc::pid_t| p > 0)
+            .ok_or_else(|| format!("invalid PID: {}", arg.to_string_lossy()))?;
+        if cfg.netns.is_some() {
+            return Err("both --netns and a PID given".into());
+        }
+        cfg.pid = Some(pid);
+        cfg.command.clear();
+    }
+
+    if cfg.netns.is_some() || cfg.pid.is_some() {
         if !cfg.command.is_empty() {
             return Err("both --netns and a command given".into());
         }
         if cfg.root {
-            return Err("--root is for running a command, not with --netns".into());
+            return Err("--root is for running a command, not for attaching".into());
         }
     } else if cfg.command.is_empty() {
         cfg.command.push(std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into()));
@@ -847,7 +867,7 @@ mod tests {
     fn resolve_localhost() {
         let mut forwards = fwds("8080:localhost/80,8081-8082:localhost/81-82");
         forwards.push(fwd("80:192.0.2.1"));
-        let mut cfg = Config { forwards, root: false, debug: false, netns: None,
+        let mut cfg = Config { forwards, root: false, debug: false, netns: None, pid: None,
                                command: Vec::new() };
         cfg.resolve().unwrap();
         let Target::Host { addrs, .. } = &cfg.forwards[0].target else { panic!() };
@@ -1006,6 +1026,15 @@ mod tests {
         assert_eq!(cfg.netns.unwrap(), PathBuf::from("/run/netns/ctr"));
         let cfg = args(&["--netns", "./ns"]).unwrap().unwrap();
         assert_eq!(cfg.netns.unwrap(), PathBuf::from("./ns"));
+        let cfg = args(&["-T", "80", "1234"]).unwrap().unwrap();
+        assert_eq!((cfg.pid, cfg.netns, cfg.command.len()), (Some(1234), None, 0));
+        let cfg = args(&["--", "42"]).unwrap().unwrap();
+        assert_eq!(cfg.pid, Some(42));
+        let cfg = args(&["42", "x"]).unwrap().unwrap();
+        assert_eq!((cfg.pid, cfg.command.len()), (None, 2));
+        for bad in [&["0"][..], &["99999999999"], &["--netns", "x", "1"], &["--root", "1"]] {
+            assert!(args(bad).is_err(), "{bad:?} should be invalid");
+        }
         for bad in [&["--netns"][..], &["--netns="], &["--netns", "x", "true"],
                     &["--netns", "x", "--", "true"], &["--root", "--netns", "x"], &["--netnsx"]] {
             assert!(args(bad).is_err(), "{bad:?} should be invalid");

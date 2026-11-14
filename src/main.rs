@@ -371,6 +371,8 @@ enum Mode {
     Command { pid: libc::pid_t, pidfd: OwnedFd, sigfd: OwnedFd },
     /// Attached to an existing network namespace: run until terminated
     Attached,
+    /// Attached to the network namespace of a process: run until it exits
+    Process { pid: libc::pid_t, pidfd: OwnedFd },
 }
 
 impl Mode {
@@ -379,6 +381,7 @@ impl Mode {
         match self {
             Mode::Command { pidfd, sigfd, .. } => vec![pidfd.as_raw_fd(), sigfd.as_raw_fd()],
             Mode::Attached => Vec::new(),
+            Mode::Process { pidfd, .. } => vec![pidfd.as_raw_fd()],
         }
     }
 }
@@ -468,12 +471,23 @@ fn run(mut cfg: Config) -> Result<u8, String> {
         }
     }
 
-    let (mut listeners, netns, mode) = match &cfg.netns {
-        Some(path) => {
+    let (mut listeners, netns, mode) = match (&cfg.netns, cfg.pid) {
+        (Some(path), _) => {
             let (listeners, netns) = attach(path, &ports, nhost > 0)?;
             (listeners, netns, Mode::Attached)
         }
-        None => {
+        (None, Some(pid)) => {
+            // First the pidfd, then the namespace: if the process hasn't
+            // exited since, the PID wasn't reused, and it's its namespace
+            let pidfd = sys::pidfd_open(pid).map_err(|e| format!("process {pid}: {e}"))?;
+            let path = std::path::PathBuf::from(format!("/proc/{pid}/ns/net"));
+            let (listeners, netns) = attach(&path, &ports, nhost > 0)?;
+            if sys::pidfd_exited(&pidfd).map_err(|e| format!("poll(): {e}"))? {
+                return Err(format!("process {pid} exited"));
+            }
+            (listeners, netns, Mode::Process { pid, pidfd })
+        }
+        (None, None) => {
             // Before fork(), so that no signal for the command is missed
             let sigs = signals::block().map_err(|e| format!("cannot block signals: {e}"))?;
             let Sandbox { pid, pidfd, listeners, netns } =
@@ -501,11 +515,18 @@ fn run(mut cfg: Config) -> Result<u8, String> {
     }
 
     let ep = Epoll::new().map_err(|e| format!("cannot create epoll descriptor: {e}"))?;
-    if let Mode::Command { pidfd, sigfd, .. } = &mode {
-        ep.add(pidfd.as_raw_fd(), libc::EPOLLIN as u32, Ref::Child)
-            .map_err(|e| format!("epoll_ctl(): {e}"))?;
-        ep.add(sigfd.as_raw_fd(), libc::EPOLLIN as u32, Ref::Signal)
-            .map_err(|e| format!("epoll_ctl(): {e}"))?;
+    match &mode {
+        Mode::Command { pidfd, sigfd, .. } => {
+            ep.add(pidfd.as_raw_fd(), libc::EPOLLIN as u32, Ref::Child)
+                .map_err(|e| format!("epoll_ctl(): {e}"))?;
+            ep.add(sigfd.as_raw_fd(), libc::EPOLLIN as u32, Ref::Signal)
+                .map_err(|e| format!("epoll_ctl(): {e}"))?;
+        }
+        Mode::Process { pidfd, .. } => {
+            ep.add(pidfd.as_raw_fd(), libc::EPOLLIN as u32, Ref::Child)
+                .map_err(|e| format!("epoll_ctl(): {e}"))?;
+        }
+        Mode::Attached => {}
     }
     for (i, l) in listeners.iter().enumerate() {
         ep.add(l.fd.as_raw_fd(), libc::EPOLLIN as u32, Ref::Listener(i))
@@ -558,6 +579,11 @@ fn run(mut cfg: Config) -> Result<u8, String> {
                 }
                 (Ref::Signal, Mode::Command { pidfd, sigfd, .. }) => {
                     forward_signals(sigfd.as_raw_fd(), pidfd.as_raw_fd());
+                }
+                (Ref::Child, Mode::Process { pid, .. }) => {
+                    // Not our child: nothing to reap
+                    debug!("process {pid} exited");
+                    return Ok(0);
                 }
                 (Ref::Child | Ref::Signal, _) => unreachable!("no command"),
                 (Ref::Listener(i), _) => fwd.listener_event(i),

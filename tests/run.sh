@@ -366,6 +366,27 @@ check "--netns: network namespace out of reach" unshare -Ur sh -c "
 	grep -q 'cannot get user namespace owning the network namespace' '${TMP}/err'" \
 	9</proc/self/ns/net
 
+# Attached by PID: until the process exits
+att_pid() {
+	att_target "exec python3 '${TESTS}/tcp_server.py' 0.0.0.0:8000 >/dev/null" || return 1
+	sleep 0.5
+	"${B}" -t 28000:8000 -- "${NSPID}" & SPID=$!
+	sleep 0.5; out="$(python3 "${TESTS}/tcp_client.py" 127.0.0.1 28000 2>&1)"
+	kill "${TPID}"; wait "${TPID}" || :
+	r=0; i=0; while kill -0 "${SPID}" 2>/dev/null; do
+		i=$((i + 1)); [ ${i} -lt 40 ] || { echo "still running"; kill "${SPID}"; r=1; break; }
+		sleep 0.05
+	done
+	s=0; wait "${SPID}" || s=$?
+	[ ${s} -eq 0 ] || { echo "exit status ${s}"; r=1; }
+	[ "${out}" = "127.0.0.1 8000" ] || { echo "got: ${out}"; r=1; }
+	return ${r}
+}
+check "PID: forwarding until the process exits, then exit status 0" att_pid
+
+check "PID: no such process" sh -c "! '${B}' -T 7000 2147483647 2>'${TMP}/err' &&
+	grep -q 'process 2147483647: No such process' '${TMP}/err'"
+
 check "exit status passed through" sh -c "'${B}' -- sh -c 'exit 7'; test \$? -eq 7"
 
 check "no descriptors leaked to command" sh -c "'${B}' -T 8000:'${TMP}/echo.sock' -U 53 \

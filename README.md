@@ -211,6 +211,7 @@ settings, as for any other process.
 
 ```sh
 specchio --netns /run/user/1000/netns/my-ns -T 3128:/run/user/1000/proxy.sock -t 8080
+specchio -T 3128:/run/user/1000/proxy.sock -t 8080 -- 12345
 ```
 
 With `--netns PATH` (or `--netns NAME`, for `/run/netns/NAME`), specchio
@@ -221,6 +222,15 @@ namespace alive, and it can't tell whether anything will use it again. Tie
 its lifetime to whatever owns the namespace, with a systemd unit, for
 example. (`pasta` instead watches the namespace's directory with inotify,
 and exits when the namespace's file is deleted.)
+
+With a PID instead of a command (a lone number, as in `pasta`), specchio
+attaches to the network namespace of that process, and exits, with status
+0, once the process exits, which it learns from a pidfd. It opens the pidfd
+before the namespace (`/proc/PID/ns/net`), and checks that the process is
+still there afterwards, so that a reused PID can't make it attach to the
+wrong namespace. Other processes might still use the namespace: specchio
+stops forwarding anyway. Opening `/proc/PID/ns/net` needs the same access as
+`ptrace` would (the same user, and a dumpable process).
 
 - specchio joins the user namespace that owns the network namespace, which
   it finds by itself (`NS_GET_USERNS`), unless it's already in it. So it
@@ -234,8 +244,8 @@ and exits when the namespace's file is deleted.)
   harmless if it's already up, and needed for forwarding (`unshare -n`
   leaves it down). It changes nothing else there: the settings for ports
   below 1024 and `ping` (see above) are left alone.
-- `--root`, and a command, aren't allowed with `--netns`. Signals aren't
-  forwarded, as there's no command: `SIGTERM` stops specchio.
+- `--root`, and a command, aren't allowed with `--netns` or a PID. Signals
+  aren't forwarded, as there's no command: `SIGTERM` stops specchio.
 
 ## How it works
 

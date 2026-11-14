@@ -155,6 +155,25 @@ pub fn local_addr(fd: RawFd) -> io::Result<SocketAddr> {
     sockaddr_to_ip(&ss).ok_or_else(|| io::Error::other("not an IP socket"))
 }
 
+/// Get a pidfd for process @pid
+pub fn pidfd_open(pid: libc::pid_t) -> io::Result<OwnedFd> {
+    // SAFETY: pidfd_open() has no memory safety preconditions
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fd was just created and is owned by nobody else
+    Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
+}
+
+/// Whether the process referred to by @pidfd has exited (pidfd is readable)
+pub fn pidfd_exited(pidfd: &OwnedFd) -> io::Result<bool> {
+    let mut p = libc::pollfd { fd: pidfd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+    // SAFETY: Passing one valid pollfd
+    cvt(unsafe { libc::poll(&mut p, 1, 0) })?;
+    Ok(p.revents & libc::POLLIN != 0)
+}
+
 /// Create a non-blocking pipe, return (read end, write end)
 pub fn pipe2_nonblock() -> io::Result<(OwnedFd, OwnedFd)> {
     let mut fds = [-1; 2];
