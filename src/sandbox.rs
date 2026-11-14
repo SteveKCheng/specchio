@@ -11,20 +11,19 @@
 //!    GID to root, so that the child gets CAP_NET_ADMIN over the new network
 //!    namespace
 //! 2. bring up the loopback interface
-//! 3. create the listening sockets for all forwards
-//! 4. send them to the parent with SCM_RIGHTS over a socketpair
+//! 3. create the listening sockets for all forwarded ports
+//! 4. send them to the parent with SCM_RIGHTS over a socketpair, in batches
 //! 5. close everything and exec() the command
 //!
 //! The parent never needs any capability, or to enter any namespace.
 
-use std::ffi::CString;
+use std::ffi::{CString, OsString};
 use std::io::{self, Write as _};
 use std::mem::zeroed;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 
-use crate::config::Config;
 use crate::fdpass;
 use crate::sys::{self, cvt};
 
@@ -36,8 +35,6 @@ const MSG_ERR: u8 = b'E';
 pub struct Listener {
     pub fd: OwnedFd,
     pub addr: SocketAddr,
-    /// Index of the forward in `Config::forwards`
-    pub fwd: usize,
 }
 
 pub struct Sandbox {
@@ -46,14 +43,14 @@ pub struct Sandbox {
     pub listeners: Vec<Listener>,
 }
 
-/// Start @cfg.command in a new sandbox, with listening sockets for forwards
+/// Start @command in a new sandbox, with a listening socket for each of @ports,
+/// in order
 ///
 /// @nofile is the original RLIMIT_NOFILE, restored for the command
-pub fn spawn(cfg: &Config, nofile: &libc::rlimit) -> io::Result<Sandbox> {
-    let ports: Vec<u16> = cfg.forwards.iter().map(|f| f.port).collect();
-
+pub fn spawn(command: &[OsString], ports: &[u16], nofile: &libc::rlimit)
+             -> io::Result<Sandbox> {
     // Prepare everything that allocates before fork()
-    let argv: Vec<CString> = cfg.command.iter()
+    let argv: Vec<CString> = command.iter()
         .map(|a| CString::new(a.as_bytes()))
         .collect::<Result<_, _>>()
         .map_err(|_| io::Error::other("NUL byte in command argument"))?;
@@ -76,31 +73,25 @@ pub fn spawn(cfg: &Config, nofile: &libc::rlimit) -> io::Result<Sandbox> {
     let pid = cvt(unsafe { libc::fork() })?;
     if pid == 0 {
         drop(ours);
-        child(theirs, uid, gid, ppid, &ports, nofile, &argvp);
+        child(theirs, uid, gid, ppid, ports, nofile, &argvp);
     }
     drop(theirs);
 
-    let mut buf = [0u8; 4096];
-    let (n, fds) = fdpass::recv(ours.as_fd(), &mut buf)?;
-    let msg = &buf[..n];
-
-    if msg.first() != Some(&MSG_OK) {
-        reap(pid);
-        return Err(match msg {
-            [MSG_ERR, why @ ..] => io::Error::other(String::from_utf8_lossy(why).into_owned()),
-            _ => io::Error::other("sandbox setup failed"),
-        });
-    }
-
-    // One listening socket per forward, in order
-    if msg.len() != 1 || fds.len() != ports.len() {
-        reap(pid);
-        return Err(io::Error::other("malformed message from sandbox"));
-    }
-    let listeners = fds.into_iter().enumerate()
-        .map(|(fwd, fd)| {
+    let fds = match recv_sockets(&ours, ports.len()) {
+        Ok(fds) => fds,
+        Err(e) => {
+            // The child exits by itself on errors, but not if the message was
+            // malformed: make sure it doesn't run the command
+            // SAFETY: Signalling our own unreaped child
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            reap(pid);
+            return Err(e);
+        }
+    };
+    let listeners = fds.into_iter()
+        .map(|fd| {
             let addr = sys::local_addr(fd.as_raw_fd())?;
-            Ok(Listener { fd, addr, fwd })
+            Ok(Listener { fd, addr })
         })
         .collect::<io::Result<_>>()?;
 
@@ -118,6 +109,30 @@ pub fn spawn(cfg: &Config, nofile: &libc::rlimit) -> io::Result<Sandbox> {
     let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd as RawFd) };
 
     Ok(Sandbox { pid, pidfd, listeners })
+}
+
+/// Receive @n sockets from the child, in batches of at most fdpass::MAX_FDS
+fn recv_sockets(sock: &OwnedFd, n: usize) -> io::Result<Vec<OwnedFd>> {
+    let mut all = Vec::with_capacity(n);
+    loop {
+        let mut buf = [0u8; 4096];
+        let (len, fds) = fdpass::recv(sock.as_fd(), &mut buf)?;
+        match &buf[..len] {
+            [MSG_OK] => {}
+            [MSG_ERR, why @ ..] => {
+                return Err(io::Error::other(String::from_utf8_lossy(why).into_owned()));
+            }
+            [] => return Err(io::Error::other("sandbox setup failed")),
+            _ => return Err(io::Error::other("malformed message from sandbox")),
+        }
+        if (fds.is_empty() && n > 0) || all.len() + fds.len() > n {
+            return Err(io::Error::other("malformed message from sandbox"));
+        }
+        all.extend(fds);
+        if all.len() == n {
+            return Ok(all);
+        }
+    }
 }
 
 /// Wait for child @pid to terminate, return the exit code to use for it
@@ -144,11 +159,14 @@ fn child(sock: OwnedFd, uid: libc::uid_t, gid: libc::gid_t, ppid: libc::pid_t,
          ports: &[u16], nofile: &libc::rlimit,
          argv: &[*const libc::c_char]) -> ! {
     match child_setup(uid, gid, ppid, ports) {
-        Ok((msg, fds)) => {
+        Ok(fds) => {
             let raw: Vec<RawFd> = fds.iter().map(|f| f.as_raw_fd()).collect();
-            if fdpass::send(sock.as_fd(), &msg, &raw).is_err() {
-                // SAFETY: Leaving without running any destructors is fine
-                unsafe { libc::_exit(1) };
+            // At least one message, even without sockets
+            for batch in raw.chunks(fdpass::MAX_FDS).chain(raw.is_empty().then_some(&[][..])) {
+                if fdpass::send(sock.as_fd(), &[MSG_OK], batch).is_err() {
+                    // SAFETY: Leaving without running any destructors is fine
+                    unsafe { libc::_exit(1) };
+                }
             }
             // The command must not get hold of the listening sockets
             drop(fds);
@@ -179,11 +197,11 @@ fn child(sock: OwnedFd, uid: libc::uid_t, gid: libc::gid_t, ppid: libc::pid_t,
     unsafe { libc::_exit(127) }
 }
 
-/// Set up namespaces and listening sockets in the child
+/// Set up namespaces and sockets in the child
 ///
-/// Return: message for the parent and descriptors to attach, or error string
+/// Return: sockets for the parent, or error string
 fn child_setup(uid: libc::uid_t, gid: libc::gid_t, ppid: libc::pid_t,
-               ports: &[u16]) -> Result<(Vec<u8>, Vec<OwnedFd>), String> {
+               ports: &[u16]) -> Result<Vec<OwnedFd>, String> {
     // SAFETY: unshare() has no memory safety preconditions
     cvt(unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) })
         .map_err(|e| format!("cannot create namespaces: {e}"))?;
@@ -212,12 +230,10 @@ fn child_setup(uid: libc::uid_t, gid: libc::gid_t, ppid: libc::pid_t,
 
     loopback_up().map_err(|e| format!("cannot bring up loopback interface: {e}"))?;
 
-    let fds = ports.iter()
+    ports.iter()
         .map(|&port| listen(port)
              .map_err(|e| format!("cannot listen on port {port} in namespace: {e}")))
-        .collect::<Result<_, _>>()?;
-
-    Ok((vec![MSG_OK], fds))
+        .collect()
 }
 
 fn write_proc(path: &str, content: &str) -> io::Result<()> {

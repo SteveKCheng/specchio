@@ -21,22 +21,27 @@ specchio -T 3128:/run/user/1000/proxy.sock -- \
 
 ### `-T`, `--tcp-ns`
 
-This uses `pasta`'s syntax, one port per option; `-T` can be repeated:
+This uses `pasta`'s syntax; `-T` can be repeated:
 
 | Spec | In the namespace | Connects to on the host |
 |---|---|---|
 | `-T none` | nothing | |
+| `-T 80,443` | ports 80 and 443 | the same ports (each item of a list can have its own target) |
+| `-T 8000-8010` | ports 8000 to 8010 | the same ports |
+| `-T 8000-8010:9000-9010` | same | ports 9000 to 9010 (8000 → 9000, 8001 → 9001, ...) |
+| `-T 8000-8010,~8005` | ports 8000 to 8004 and 8006 to 8010 | the same ports (exclusions apply to the whole list) |
 | `-T 8080` | any loopback address, port 8080 | the same loopback address (`127.0.0.5` → `127.0.0.5`, `::1` → `::1`), port 8080 |
 | `-T 8080:9090` | same | the same loopback address, port 9090 |
 | `-T 8080:192.0.2.1` | same | `192.0.2.1`, port 8080 |
-| `-T 8080:192.0.2.1/9090` | same | `192.0.2.1`, port 9090 |
+| `-T 8080:192.0.2.1/9090` | same | `192.0.2.1`, port 9090 (also `[2001:db8::1]/9090` or `2001:db8::1/9090`; ranges as above) |
 | `-T 2222:build.lan/22` | same | `build.lan`, resolved at start-up, port 22 (`-T 22:build.lan` for port 22 to 22) |
-| `-T 3128:/run/proxy.sock` | same | Unix socket (also `./rel/path`, `../rel/path`; `@name` for abstract sockets) |
+| `-T 3128:/run/proxy.sock` | same | Unix socket (also `./rel/path`, `../rel/path`; `@name` for abstract sockets; `8000-8010:/run/proxy.sock` for all ports of a range) |
 
 `-t`/`--tcp-ports`, `-u`/`--udp-ports` and `-U`/`--udp-ns` are accepted
 with `none` only, as no-ops, so that `pasta` command lines like
 `pasta -t none -u none -U none -T 8080 -- ...` work unchanged. As in `pasta`,
-`-T none` is an error after other `-T` options, but not before them.
+`-T none` is an error after other `-T` options, but not before them, and a
+port can't be forwarded twice.
 
 Compared to `pasta`:
 
@@ -44,8 +49,8 @@ Compared to `pasta`:
   sandbox happens to listen on, or every port, and the point of specchio is
   to grant access explicitly.
 
-- Not supported yet: port ranges, lists (`80,443`) and exclusions (`~80`).
-  Each is rejected with an error.
+- A list of exclusions only (`-T ~80`) means all other (non-ephemeral) ports
+  in `pasta`, so it's rejected, like `all`.
 - As with `pasta`, a listening address (`ADDR/PORT`) isn't allowed for `-T`.
   specchio listens on all addresses (dual-stack), bound to `lo` with
   `SO_BINDTODEVICE`.
@@ -83,9 +88,10 @@ status (128 + signal number if the command was killed).
 ## How it works
 
 1. **Child (`sandbox.rs`)**: `unshare(CLONE_NEWUSER | CLONE_NEWNET)`, maps the
-   original UID/GID to root (a fixed one-line map), brings `lo` up, creates the
-   listening sockets, and sends them to the parent with `SCM_RIGHTS` over a
-   `socketpair`. It then closes them and `exec`s the command.
+   original UID/GID to root (a fixed one-line map), brings `lo` up, creates a
+   listening socket for each forwarded port, and sends them to the parent with
+   `SCM_RIGHTS` over a `socketpair`, at most 253 per message. It then closes
+   them and `exec`s the command.
    A socket stays in the network namespace it was created in, so the parent
    needs no capabilities and never enters the namespace (unlike `pasta`, which
    uses `setns()`). The command can't get at the listeners afterwards: they're
@@ -121,7 +127,7 @@ status (128 + signal number if the command was killed).
 
 ## Not yet done
 
-- **UDP** (`-U`), and port ranges and lists for `-T`.
+- **UDP** (`-U`).
 - **Inbound forwarding** (`-t`/`-u`, host port to sandbox). This needs sockets created in
   the sandbox namespace on demand, and a pool sent at startup can't be refilled
   once the child has `exec`'d. Options: keep a small helper process in the

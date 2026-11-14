@@ -148,7 +148,7 @@ fn probe_pipe_size() -> usize {
 pub struct Conn {
     /// Index in the connection table, used for epoll references and logging
     id: usize,
-    /// Index of the forward the connection came from
+    /// Index of the listener the connection came from, which has a target
     fwd: usize,
     /// Index of the target address being tried, see connect_reset()
     attempt: usize,

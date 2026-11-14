@@ -63,6 +63,23 @@ check "TCP, pasta-style options" tcp "127.0.0.1 18000" 127.0.0.1 18000 \
 
 check "auto and all rejected" sh -c "! '${B}' -T auto -- true && ! '${B}' -t all -- true"
 
+check "TCP, list" tcp "::1 19000" 127.0.0.1 3001 -T 3000,3001:::1/19000
+check "TCP, range" tcp "127.0.0.1 19000" 127.0.0.1 3005 -T 2995-3005:18990-19000
+check "TCP, range with exclusion" tcp "127.0.0.1 18000" 127.0.0.1 18000 \
+	-T 17990-18010,~18005,~17995-17999
+check "TCP, excluded port not forwarded" sh -c "'${B}' -T 17990-18010,~18005 -- \
+	python3 '${TESTS}/tcp_client.py' 127.0.0.1 18005 2>&1 | grep -q ConnectionRefusedError"
+check "exclusions only rejected" sh -c "! '${B}' -T ~80 -- true 2>'${TMP}/err' &&
+	grep -q 'by design' '${TMP}/err'"
+check "overlapping ports rejected" sh -c "! '${B}' -T 80-90 -T 85 -- true 2>'${TMP}/err' &&
+	grep -q 'port 85 forwarded twice' '${TMP}/err'"
+
+# More than the maximum number of descriptors per SCM_RIGHTS message (253)
+check "2999 ports" "${B}" -T 10000-12999:15001-18000,~11000 -- sh -c "
+	test \$(tail -n +2 /proc/net/tcp6 | wc -l) -eq 2999 &&
+	python3 '${TESTS}/tcp_client.py' 127.0.0.1 12999 | grep -qx '127.0.0.1 18000' &&
+	! python3 '${TESTS}/tcp_client.py' 127.0.0.1 13000 2>/dev/null"
+
 check "TCP, refused port resets connection" sh -c "'${B}' -T 18000:20000 -- \
 	python3 '${TESTS}/tcp_client.py' 127.0.0.1 18000 2>&1 | grep -q ConnectionResetError"
 

@@ -20,7 +20,7 @@ use std::os::fd::AsRawFd;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use config::{Config, Target};
+use config::{Config, Forward, Target};
 use epoll::{Epoll, Ref};
 use log::{debug, info};
 use sandbox::{Listener, Sandbox};
@@ -44,7 +44,7 @@ const CONNECT_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Clone, Copy)]
 struct Retry {
     id: usize,
-    /// Index of the forward, for logging
+    /// Index of the listener, for its target
     fwd: usize,
     peer: Peer,
     next: Instant,
@@ -57,6 +57,7 @@ struct Forwarder {
     ep: Epoll,
     pool: PipePool,
     listeners: Vec<Listener>,
+    /// Target for each listener
     targets: Vec<Target>,
     /// Connection table, indexed by connection id
     conns: Vec<Option<Conn>>,
@@ -132,17 +133,16 @@ impl Forwarder {
             });
             self.nconns += 1;
 
-            let fwd = self.listeners[li].fwd;
-            let mut conn = Conn::new(id, fwd, s);
+            let mut conn = Conn::new(id, li, s);
 
-            match peer(&self.targets[fwd], &conn) {
+            match peer(&self.targets[li], &conn) {
                 Ok(Some(peer)) => {
                     self.conns[id] = Some(conn);
-                    self.connect(id, fwd, peer, None);
+                    self.connect(id, li, peer, None);
                 }
                 Ok(None) => unreachable!("no address for first attempt"),
                 Err(e) => {
-                    info!("conn {id}: cannot connect to {}: {e}", self.targets[fwd]);
+                    info!("conn {id}: cannot connect to {}: {e}", self.targets[li]);
                     conn.rst(&self.ep);
                     self.conns[id] = Some(conn);
                     self.defer.push(id);
@@ -151,7 +151,7 @@ impl Forwarder {
         }
     }
 
-    /// Connect connection @id to @peer for forward @fwd, or queue a retry
+    /// Connect connection @id to @peer for listener @fwd, or queue a retry
     fn connect(&mut self, id: usize, fwd: usize, peer: Peer, mut retry: Option<Retry>) {
         let target = &self.targets[fwd];
         let Some(conn) = self.conns[id].as_mut() else { return };
@@ -270,8 +270,8 @@ fn peer(target: &Target, conn: &Conn) -> std::io::Result<Option<Peer>> {
             let (sun, len) = u.sockaddr().map_err(std::io::Error::other)?;
             Peer::Unix(sun, len)
         }
-        Target::Tcp { addr: Some(addr), port } => Peer::Tcp(SocketAddr::new(*addr, *port)),
-        Target::Tcp { addr: None, port } => {
+        Target::Ip { addr: Some(addr), port } => Peer::Tcp(SocketAddr::new(*addr, *port)),
+        Target::Ip { addr: None, port } => {
             // Same (loopback) address as the one connected to in the namespace
             let local = sys::local_addr(conn.fd(0))?;
             Peer::Tcp(SocketAddr::new(local.ip(), *port))
@@ -294,17 +294,18 @@ fn peer(target: &Target, conn: &Conn) -> std::io::Result<Option<Peer>> {
 
 fn run(mut cfg: Config) -> Result<u8, String> {
     cfg.resolve()?;
-    for f in &cfg.forwards {
-        if let Target::Host { name, addrs, .. } = &f.target {
-            let list: Vec<_> = addrs.iter().map(|a| a.ip().to_string()).collect();
-            debug!("{name} resolves to {}", list.join(", "));
-        }
-    }
+
+    // One listening socket in the namespace per forwarded port
+    let (ports, targets): (Vec<_>, Vec<_>) = cfg.forwards.iter().flat_map(Forward::ports).unzip();
 
     let (nofile_orig, nofile) = sys::raise_nofile()
         .map_err(|e| format!("cannot get file descriptor limit: {e}"))?;
+    if ports.len() + RESERVED_FDS > nofile {
+        return Err(format!("too many forwarded ports ({}) for the open file limit ({nofile})",
+                           ports.len()));
+    }
 
-    let Sandbox { pid, pidfd, listeners } = sandbox::spawn(&cfg, &nofile_orig)
+    let Sandbox { pid, pidfd, listeners } = sandbox::spawn(&cfg.command, &ports, &nofile_orig)
         .map_err(|e| format!("cannot start sandbox: {e}"))?;
 
     // The command has its copies of whatever we inherited: drop ours
@@ -333,7 +334,12 @@ fn run(mut cfg: Config) -> Result<u8, String> {
     for (i, l) in listeners.iter().enumerate() {
         ep.add(l.fd.as_raw_fd(), libc::EPOLLIN as u32, Ref::Listener(i))
             .map_err(|e| format!("epoll_ctl(): {e}"))?;
-        debug!("listening on {} (lo) in namespace for {}", l.addr, cfg.forwards[l.fwd].target);
+    }
+    if let Some(l) = listeners.first() {
+        let any = if l.addr.is_ipv6() { "[::]" } else { "0.0.0.0" };
+        for f in &cfg.forwards {
+            debug!("forwarding {f}, from {any} (lo) in namespace");
+        }
     }
 
     let max_conns = (nofile.saturating_sub(RESERVED_FDS + listeners.len()) / FDS_PER_CONN).max(1);
@@ -343,7 +349,7 @@ fn run(mut cfg: Config) -> Result<u8, String> {
         ep,
         pool: PipePool::new(),
         listeners,
-        targets: cfg.forwards.iter().map(|f| f.target.clone()).collect(),
+        targets,
         conns: Vec::new(),
         free: Vec::new(),
         defer: Vec::new(),
