@@ -481,7 +481,8 @@ live in the sandbox's namespace.
 
 In Rust, Option A wouldn't need the `clone()` trick: `setns(CLONE_NEWNET)`
 only affects the calling thread, so a thread could `setns()`, create the
-socket and hand back an `OwnedFd`.
+socket and hand back an `OwnedFd`. But only after the whole process has
+joined the sandbox's user namespace: see `user-ns.md`.
 
 ### Option B: what specchio does
 
@@ -498,19 +499,19 @@ everything up itself before `exec`ing the command (`src/sandbox.rs`):
 
 Compared to Option A:
 
-- The parent needs no capabilities, no namespace handle, and never enters the
-  namespace, so it can be locked down hard (later).
+- The parent needs no namespace handle, and doesn't enter the namespaces, as
+  long as it only forwards from the sandbox to the host. Inbound forwarding
+  changes this, and what it means for the parent's privileges and isolation
+  is covered in `user-ns.md`.
 - It matches the object-capability idea literally: the parent holds the
   listeners and the targets, nothing else.
 - The command can't reach the listeners: they're closed before `exec`, and the
-  parent is in the outer user namespace, out of reach of `ptrace` and
-  `pidfd_getfd()`.
+  parent is out of reach of `ptrace` and `pidfd_getfd()` (see `user-ns.md`
+  for how that holds once the parent joins the sandbox's user namespace).
 - The cost: no new sockets in the sandbox namespace after `exec`. That matters
   for **inbound** forwarding (`-t`), which needs a sandbox-side socket per
-  connection. A pool sent at startup can't be refilled. Options for later:
-  keep a small helper process in the namespace that makes sockets on request
-  over the same `socketpair`, or have the parent join the sandbox user
-  namespace and `setns()` from a thread (i.e. Option A for that part only).
+  connection, and a pool sent at startup can't be refilled. The options, and
+  the plan, are in `user-ns.md`.
 
 ---
 

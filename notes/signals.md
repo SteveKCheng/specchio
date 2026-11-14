@@ -270,7 +270,7 @@ Suggested usage, for now:
 
 Found while looking at inbound forwarding, where specchio would have to
 join the sandbox's user namespace (to `setns()` into its network
-namespace).
+namespace); `user-ns.md` has the details.
 
 - `kill(2)` only checks that the sender's real or effective user ID
   matches the target's real or saved user ID, as kernel user IDs (after
