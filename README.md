@@ -5,11 +5,10 @@ from [passt](https://passt.top/). It runs a command in new user and network
 namespaces where only `lo` exists, and forwards chosen TCP ports inside them
 to TCP ports on the host or other hosts, or to Unix domain sockets on the
 host, and chosen UDP ports to UDP ports on the host or other hosts. It also
-forwards chosen TCP ports on the host to ports inside the namespaces. TCP data
-moves only by `splice()`, and there is no TAP interface, no packet parsing
-and no `fork()` per connection. The goal is to cover all of `pasta`'s
-splicing (TCP and UDP, in both directions); so far, all but UDP from the host
-to the sandbox works.
+forwards chosen TCP and UDP ports on the host to ports inside the namespaces.
+TCP data moves only by `splice()`, and there is no TAP interface, no packet
+parsing and no `fork()` per connection. This covers all of `pasta`'s
+splicing (TCP and UDP, in both directions).
 
 The intended use is sandboxing: give a sandboxed agent access to, say, an
 HTTP(S) proxy as an object capability. The agent can reach the forwarded port
@@ -95,7 +94,9 @@ Compared to `pasta`:
   use on the host. Replies to the namespace go out through the socket
   receiving on the forwarded port, with the source address set by
   `IP_PKTINFO`/`IPV6_PKTINFO`; `pasta` instead creates a socket per flow in
-  the namespace, which specchio can't do (see "How it works"). ICMP errors
+  the namespace, which specchio could only do by joining its user namespace
+  (see "How it works"). The same goes for replies to clients on the host,
+  with `-u`, which saves a socket per flow. ICMP errors
   from the target (such as port unreachable) aren't relayed to the client,
   which sees no reply, as with `pasta`'s spliced flows.
 - Unix domain socket targets are a specchio extension. A target starting with
@@ -140,6 +141,14 @@ syntax, and lists, ranges and exclusions as for `-T`:
   namespace, from a port the kernel picks, as with `pasta`'s spliced
   connections.
 
+### `-u`, `--udp-ports`
+
+The same syntax as `-t`, for UDP. Flows work as for `-U`, the other way
+around: each flow, from a client address and port on the host, gets a socket
+in the namespace, connected to the target, and replies to it go back to the
+client from the address and port it sent to. As for `-U`, that socket isn't
+bound to the client's source port, unlike in `pasta`: the kernel picks one.
+
 With no command, specchio runs `$SHELL`. The command inherits all of
 specchio's open files, such as sockets from systemd socket activation. Once
 the command is started, specchio itself drops them: it points standard input
@@ -183,8 +192,8 @@ started as root (in whatever user namespace), the command stays root.
    and `SPLICE_F_MORE`/`TCP_NODELAY` corking). The parent waits for the command
    with a pidfd, and the child gets `PR_SET_PDEATHSIG`, so neither outlives the
    other.
-3. **From the host (`ns.rs`)**: inbound connections need a socket in the
-   namespace each, created while the command runs. So the child also sends a
+3. **From the host (`ns.rs`)**: inbound connections and UDP flows need a
+   socket in the namespace each, created while the command runs. So the child also sends a
    descriptor for its network namespace, and the parent makes itself
    non-dumpable and joins the sandbox's user namespace (the one owning the
    network namespace, found with `NS_GET_USERNS`) while it's still
@@ -199,7 +208,9 @@ started as root (in whatever user namespace), the command stays root.
    `recvmmsg()`, along with their source address and their destination
    address (`IP_PKTINFO`/`IPV6_PKTINFO`), which identify the flow (in a hash
    table). Each flow has a host side socket, `connect()`ed to the target, and
-   polled for replies. Flows that expired are closed once per second.
+   polled for replies. Flows that expired are closed once per second. Flows
+   from the host work the same way, with sockets for the target taken from
+   the pools in the namespace.
 
 TCP connections (six descriptors each: two sockets and two pipes) and UDP
 flows (one socket each) share the descriptor limit. When it's reached, TCP
@@ -227,7 +238,6 @@ dropped.
 
 ## Not yet done
 
-- **UDP from the host** (`-u`, host port to sandbox).
 - **Hardening**: seccomp, dropping the filesystem view like `pasta`'s
   `isolate_prefork()`. For path targets, that needs `O_PATH` directory handles
   opened at startup, then `fchdir()` plus `connect()` with a relative name.

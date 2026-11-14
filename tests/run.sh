@@ -227,15 +227,23 @@ check "no descriptors leaked to command" sh -c "'${B}' -T 8000:'${TMP}/echo.sock
 	-t 28000 -- sh -c 'ls /proc/self/fd' | sort -n | tr '\n' ' ' | grep -qx '0 1 2 3 '"
 
 # Run "specchio OPTION... -- SERVER [ARG]..." in the background, as SPID, and
-# wait until something accepts connections on 127.0.0.1 port 8000 in there.
-# The server is the command itself, so that it can't outlive specchio
+# wait until something accepts connections on 127.0.0.1 port 8000 in there,
+# or, with PROBE=udp, replies to datagrams sent there.  The server is the
+# command itself, so that it can't outlive specchio
 serve() {
 	opts=""; while [ "$1" != -- ]; do opts="${opts} $1"; shift; done; shift
 	rm -f "${TMP}/ready"
+	if [ "${PROBE:-tcp}" = udp ]; then
+		probe='s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(0.2)
+s.bind(("", 0)); s.sendto(b"probe", ("127.0.0.1", 8000)); s.recv(100)'
+	else
+		probe='socket.create_connection(("127.0.0.1", 8000))'
+	fi
 	# shellcheck disable=SC2086
-	"${B}" ${opts} -- sh -c '{ until python3 -c "import socket
-socket.create_connection((\"127.0.0.1\", 8000))" 2>/dev/null; do sleep 0.05; done
-		touch "$0"; } & exec "$@"' "${TMP}/ready" "$@" >/dev/null & SPID=$!
+	"${B}" ${opts} -- sh -c '{ i=0; until python3 -c "import socket
+$1" 2>/dev/null; do i=$((i + 1)); [ ${i} -lt 200 ] || exit 1; sleep 0.05; done
+		touch "$0"; } & shift; exec "$@"' "${TMP}/ready" "${probe}" "$@" >/dev/null &
+	SPID=$!
 	i=0; until [ -e "${TMP}/ready" ]; do
 		i=$((i + 1)); [ ${i} -lt 200 ] || { kill "${SPID}"; return 1; }; sleep 0.05
 	done
@@ -298,6 +306,50 @@ with cf.ThreadPoolExecutor(50) as ex: sys.exit(0 if all(ex.map(one, range(500)))
 	return ${r}
 }
 check "TCP in, 500 short connections, 50 concurrent" tin_many
+
+# Send datagrams to ADDR PORT on the host, forwarded into the sandbox, with a
+# server on 127.0.0.1, 127.0.0.2, 127.0.0.5 and ::1 port 8000 in there, check
+# replies and the address reached, or the last line of the client's error
+uin() {
+	expect="$1"; addr="$2"; port="$3"; shift 3
+	PROBE=udp serve "$@" -- python3 "${TESTS}/udp_server.py" 127.0.0.1:8000 127.0.0.2:8000 \
+		127.0.0.5:8000 [::1]:8000 || return 1
+	out="$(python3 "${TESTS}/udp_client.py" "${addr}" "${port}" ${COUNT:-} ${SIZE:-} 2>&1 |
+		tail -n 1)"
+	kill "${SPID}"; wait "${SPID}" || :
+	[ "${out}" = "${expect}" ] || { echo "got: ${out}"; return 1; }
+}
+
+check "UDP in, same loopback address" uin "127.0.0.5 8000" 127.0.0.5 28000 -u 28000:8000
+check "UDP in, IPv6 loopback" uin "::1 8000" ::1 28000 -u 28000:8000
+check "UDP in, listening and target address" uin "127.0.0.2 8000" 127.0.0.1 28000 \
+	-u 127.0.0.1/28000:127.0.0.2/8000
+check "UDP in, other address: no reply" uin "TimeoutError: timed out" ::1 28000 \
+	-u 127.0.0.1/28000:8000
+check "UDP in, range, with TCP and outbound forwards" uin "127.0.0.1 8000" 127.0.0.1 28000 \
+	-u 27990-28000:7990-8000 -t 28000 -T 18000 -U 18000 -U 8001
+uin_big() {
+	COUNT=200; SIZE=65000; r=0
+	uin "::1 8000" ::1 28000 -u 28000:8000 || r=1
+	unset COUNT SIZE; return ${r}
+}
+check "UDP in, 200 datagrams of 65000 bytes, IPv6" uin_big
+
+uin_flows() {
+	PROBE=udp serve -u 28000:8000 -- python3 "${TESTS}/udp_server.py" 127.0.0.1:8000 ||
+		return 1
+	r=0; python3 -c '
+import socket
+ss = [socket.socket(socket.AF_INET, socket.SOCK_DGRAM) for i in range(100)]
+for i, s in enumerate(ss):
+    s.bind(("", 0)); s.settimeout(5); s.sendto(str(i).encode(), ("127.0.0.1", 28000))
+for i, s in enumerate(ss):
+    assert s.recv(100) == f"127.0.0.1 8000\n{i}".encode()' || r=1
+	grep -q "^Threads:[[:space:]]*1$" "/proc/${SPID}/status" || { echo "threads left"; r=1; }
+	kill "${SPID}"; wait "${SPID}" || :
+	return ${r}
+}
+check "UDP in, 100 concurrent flows" uin_flows
 
 # specchio joined the user namespace of the sandbox, where the command is root
 check "TCP in, --root: command can't take descriptors from specchio or trace it" \

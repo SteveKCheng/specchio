@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "GPL-2.0-or-later"
-description = "Forward TCP (spliced) and UDP ports from a loopback-only network namespace to the host"
+description = "Forward TCP (spliced) and UDP ports between a loopback-only network namespace and the host"
 
 [dependencies]
 libc = "0.2"

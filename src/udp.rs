@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! UDP flows from the namespace to the host
+//! UDP flows from the namespace to the host, and from the host to the
+//! namespace
 //!
 //! Modelled on udp.c and udp_flow.c in passt:
 //!   Copyright (c) 2020-2021 Red Hat GmbH
@@ -9,25 +10,29 @@
 //!
 //! # Theory of Operation
 //!
-//! As in pasta, a flow is a client in the namespace (address and port)
-//! sending to one of our forwarded ports, at one of the loopback addresses
-//! there.  For each flow, we create a socket on the host side, connect()ed to
-//! the target, so that it receives replies for this flow only.  Datagrams are
-//! copied with recvmmsg() and sendmmsg(): splice() doesn't apply to them.
+//! As in pasta, a flow is a client (address and port) sending to one of our
+//! forwarded ports, at one of the addresses we receive on: in the namespace,
+//! or on the host for inbound forwarding (-u).  For each flow, we create a
+//! socket on the other side, connect()ed to the target, so that it receives
+//! replies for this flow only: on the host, or in the namespace, from a pool
+//! of sockets created there (see ns.rs).  Datagrams are copied with
+//! recvmmsg() and sendmmsg(): splice() doesn't apply to them.
 //!
-//! pasta sends replies to the namespace through another flow specific socket,
-//! bound to the forwarded port and connect()ed to the client.  We can't create
-//! sockets in the namespace once the command runs, so replies go out through
-//! the receiving socket for the forwarded port, which is bound to the wildcard
-//! address, as sendmsg() with the original destination address of the client's
-//! datagrams as source (IP_PKTINFO or IPV6_PKTINFO).  Clients see replies come
-//! from the address and port they sent to, as with pasta.
+//! pasta sends replies to the client through another flow specific socket,
+//! bound to the forwarded port and connect()ed to the client.  Instead,
+//! replies go out through the receiving socket for the forwarded port, which
+//! is bound to the wildcard address (unless a listening address was given
+//! for -u), as sendmsg() with the original destination address of the
+//! client's datagrams as source (IP_PKTINFO or IPV6_PKTINFO).  For outbound
+//! forwarding, we couldn't create sockets in the namespace anyway, and doing
+//! the same for inbound forwarding saves a socket per flow.  Clients see
+//! replies come from the address and port they sent to, as with pasta.
 //!
-//! Unlike in pasta, the host side socket isn't bound to the source address and
-//! port of the client: the kernel picks them, as for TCP.  The client's source
-//! address is a loopback address in the namespace, which makes no sense as a
-//! source for targets that aren't on loopback, and its source port might be
-//! in use on the host.
+//! Unlike in pasta, the socket for the target isn't bound to the source port
+//! (or, for outbound flows, address) of the client: the kernel picks them, as
+//! for TCP.  For outbound flows, the client's source address is a loopback
+//! address in the namespace, which makes no sense as a source for targets
+//! that aren't on loopback, and its source port might be in use on the host.
 //!
 //! Flows expire as in pasta, after UDP_TIMEOUT without datagrams in either
 //! direction, or UDP_TIMEOUT_STREAM for flows with more than one datagram on
@@ -42,7 +47,7 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::ptr;
 use std::time::{Duration, Instant};
 
-use crate::config::Target;
+use crate::config::{self, Target};
 use crate::epoll::{Epoll, Ref};
 use crate::log::{debug, info};
 use crate::sys::{self, cvt, retry_eintr};
@@ -66,7 +71,7 @@ const CTRL_U64S: usize = 8;
 type Key = (usize, IpAddr, SocketAddr);
 
 struct Flow {
-    /// Host side socket, connected to the target
+    /// Socket connected to the target: on the host, or in the namespace
     sock: OwnedFd,
     key: Key,
     /// Address of the client, as received, to send replies to
@@ -289,6 +294,17 @@ fn pktinfo(buf: &mut [u64; CTRL_U64S], addr: IpAddr, v6: bool) -> usize {
     }
 }
 
+/// Receiving socket for a forwarded port, and where datagrams go
+pub struct Recv<'a> {
+    /// Index of the socket, for flow keys and epoll references
+    pub index: usize,
+    pub fd: RawFd,
+    pub port: u16,
+    pub target: &'a Target,
+    /// Receiving on the host, target in the namespace
+    pub inbound: bool,
+}
+
 /// UDP flow table
 pub struct Udp {
     flows: Vec<Option<Flow>>,
@@ -331,16 +347,16 @@ impl Udp {
         }
     }
 
-    /// Handle datagrams from the namespace on receiving socket @li (@lfd), for
-    /// port @lport, which is forwarded to @target.  New flows can be created as long
-    /// as @can_add() says there are descriptors left
-    pub fn recv_ns(&mut self, ep: &Epoll, li: usize, lfd: RawFd, lport: u16, target: &Target,
-                   can_add: impl Fn(usize) -> bool) {
+    /// Handle datagrams from clients on receiving socket @r.  New flows can be
+    /// created as long as @can_add() says there are descriptors left, with
+    /// sockets from @new_sock(), for IPv6 if its argument is set
+    pub fn recv_clients(&mut self, ep: &Epoll, r: &Recv, can_add: impl Fn(usize) -> bool,
+                        mut new_sock: impl FnMut(bool) -> io::Result<OwnedFd>) {
         let mut bufs = self.bufs.take().unwrap_or_else(Bufs::new);
-        let n = match bufs.recv(lfd, true) {
+        let n = match bufs.recv(r.fd, true) {
             Ok(n) => n,
             Err(e) => {
-                debug!("UDP: cannot receive from namespace: {e}");
+                debug!("UDP: cannot receive from {}: {e}", side(r.inbound, 0));
                 0
             }
         };
@@ -350,7 +366,7 @@ impl Udp {
         let mut run: Vec<usize> = Vec::with_capacity(BATCH);
         let mut run_flow = None;
         for i in 0..n {
-            let flow = self.classify(ep, &bufs, i, li, lport, target, now, &can_add);
+            let flow = self.classify(ep, &bufs, i, r, now, &can_add, &mut new_sock);
             if flow != run_flow || flow.is_none() {
                 if let Some(id) = run_flow {
                     self.send_host(&mut bufs, id, &run);
@@ -373,17 +389,17 @@ impl Udp {
         let flow = self.flows[id].as_ref().unwrap();
         let dropped = bufs.send(flow.sock.as_raw_fd(), idx, None, None);
         if dropped > 0 {
-            debug!("UDP flow {id}: dropped {dropped} datagram(s) to host");
+            debug!("UDP flow {id}: dropped {dropped} datagram(s) to target");
         }
     }
 
-    /// Find or create the flow for datagram @i received on socket @li
+    /// Find or create the flow for datagram @i received on socket @r
     #[allow(clippy::too_many_arguments)]
-    fn classify(&mut self, ep: &Epoll, bufs: &Bufs, i: usize, li: usize, lport: u16,
-                target: &Target, now: Instant, can_add: &impl Fn(usize) -> bool)
-                -> Option<usize> {
+    fn classify(&mut self, ep: &Epoll, bufs: &Bufs, i: usize, r: &Recv, now: Instant,
+                can_add: &impl Fn(usize) -> bool,
+                new_sock: &mut impl FnMut(bool) -> io::Result<OwnedFd>) -> Option<usize> {
         bufs.payload(i).or_else(|| {
-            debug!("UDP: dropping oversized datagram from namespace");
+            debug!("UDP: dropping oversized datagram from {}", side(r.inbound, 0));
             None
         })?;
         let (name, namelen) = bufs.name(i);
@@ -393,7 +409,7 @@ impl Udp {
             return None;
         };
 
-        let key = (li, local, client);
+        let key = (r.index, local, client);
         if let Some(&id) = self.map.get(&key) {
             return Some(id);
         }
@@ -406,14 +422,15 @@ impl Udp {
             return None;
         }
 
+        let target = r.target;
         let peers: Vec<SocketAddr> = match target {
             Target::Ip { addr: Some(a), port } => vec![SocketAddr::new(*a, *port)],
-            Target::Ip { addr: None, port } => vec![SocketAddr::new(local, *port)],
+            Target::Ip { addr: None, port } => vec![SocketAddr::new(config::auto_addr(local), *port)],
             Target::Host { addrs, .. } => addrs.clone(),
             Target::Unix(_) => unreachable!("Unix domain socket target for UDP"),
         };
         let mut last = None;
-        let sock = peers.iter().find_map(|peer| match connect(peer) {
+        let sock = peers.iter().find_map(|peer| match connect(new_sock, peer) {
             Ok(s) => Some((s, peer)),
             Err(e) => {
                 debug!("UDP: cannot connect to {peer}: {e}");
@@ -437,9 +454,10 @@ impl Udp {
             return None;
         }
         if crate::log::debug_enabled() {
-            let local_sa = SocketAddr::new(local, lport);
-            let host_sa = sys::local_addr(sock.as_raw_fd()).map_or("?".into(), |a| a.to_string());
-            debug!("UDP flow {id}: {client} -> {local_sa} in namespace, {host_sa} -> {peer} on host");
+            let local_sa = SocketAddr::new(local, r.port);
+            let src = sys::local_addr(sock.as_raw_fd()).map_or("?".into(), |a| a.to_string());
+            debug!("UDP flow {id}: {client} -> {local_sa} {}, {src} -> {peer} {}", side(r.inbound, 0),
+                   side(r.inbound, 1));
         }
 
         if self.nflows == 0 {
@@ -457,9 +475,9 @@ impl Udp {
         Some(id)
     }
 
-    /// Handle replies on the host side socket of flow @id, and send them to
-    /// the client in the namespace from receiving socket @lfd
-    pub fn recv_host(&mut self, id: usize, lfd: RawFd, lfd_v6: bool) {
+    /// Handle replies on the target side socket of flow @id, and send them to
+    /// the client from receiving socket @lfd
+    pub fn recv_replies(&mut self, id: usize, lfd: RawFd, lfd_v6: bool) {
         let Some(flow) = self.flows.get_mut(id).and_then(Option::as_mut) else { return };
         let bufs = self.bufs.get_or_insert_with(Bufs::new);
 
@@ -473,7 +491,7 @@ impl Udp {
         };
         let idx: Vec<usize> = (0..n).filter(|&i| bufs.payload(i).is_some()).collect();
         if idx.len() < n {
-            debug!("UDP flow {id}: dropping oversized datagram(s) from host");
+            debug!("UDP flow {id}: dropping oversized datagram(s) from target");
         }
         if idx.is_empty() {
             return;
@@ -482,7 +500,7 @@ impl Udp {
         flow.active(1, Instant::now());
         let dropped = bufs.send(lfd, &idx, Some(&flow.client), Some((flow.key.1, lfd_v6)));
         if dropped > 0 {
-            debug!("UDP flow {id}: dropped {dropped} datagram(s) to namespace");
+            debug!("UDP flow {id}: dropped {dropped} datagram(s) to client");
         }
     }
 
@@ -517,10 +535,15 @@ impl Udp {
     }
 }
 
-/// Create a UDP socket connected to @peer
-fn connect(peer: &SocketAddr) -> io::Result<OwnedFd> {
-    let af = if peer.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
-    let s = sys::socket(af, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK)?;
+/// Where clients (side 0) or targets (side 1) are, for inbound flows or not
+fn side(inbound: bool, sidei: usize) -> &'static str {
+    if inbound == (sidei == 0) { "on host" } else { "in namespace" }
+}
+
+/// Get a UDP socket from @new_sock, and connect it to @peer
+fn connect(new_sock: &mut impl FnMut(bool) -> io::Result<OwnedFd>, peer: &SocketAddr)
+           -> io::Result<OwnedFd> {
+    let s = new_sock(peer.is_ipv6())?;
     let (sa, len) = sys::sockaddr_ip(peer);
     // SAFETY: sa is a valid socket address of length len
     cvt(unsafe { libc::connect(s.as_raw_fd(), (&sa as *const libc::sockaddr_storage).cast(), len) })?;

@@ -204,9 +204,9 @@ own user namespace, single-threaded, and dumpable):
    the background. The main thread never leaves the host's network
    namespace, as it couldn't come back, and specchio is single-threaded
    again once the thread is joined.
-6. An inbound connection takes a socket of the IP version of its target from
-   a pool, and `connect()`s it from the main thread: the socket stays in the
-   network namespace it was created in.
+6. An inbound TCP connection or UDP flow takes a socket of the IP version of
+   its target from a pool, and `connect()`s it from the main thread: the
+   socket stays in the network namespace it was created in.
 
 Checked: with `--root`, the command (root in the user namespace specchio
 joined) gets `EPERM` from both `pidfd_getfd()` and `PTRACE_ATTACH` on

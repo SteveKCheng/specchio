@@ -6,7 +6,7 @@
 //! network namespaces where only the loopback interface exists, and forward
 //! selected TCP ports in there to TCP ports or Unix domain sockets on the
 //! host, moving data with splice() only, and selected UDP ports to UDP ports
-//! on the host, and selected TCP ports on the host to ports in there.
+//! on the host, and selected ports on the host to ports in there.
 
 mod config;
 mod epoll;
@@ -131,8 +131,18 @@ impl Forwarder {
             Proto::Tcp => self.accept(li),
             Proto::Udp => {
                 let (budget, nconns) = (self.fd_budget, self.nconns);
-                self.udp.recv_ns(&self.ep, li, l.fd.as_raw_fd(), l.addr.port(), &self.targets[li],
-                                 |nflows| fds_left(budget, nconns, nflows, FDS_PER_FLOW));
+                let r = udp::Recv { index: li, fd: l.fd.as_raw_fd(), port: l.addr.port(),
+                                    target: &self.targets[li], inbound: l.inbound };
+                let ns = &mut self.ns;
+                // Inbound: sockets for the target in the namespace
+                let new_sock = |v6: bool| match ns {
+                    Some(ns) if r.inbound => ns.take(Proto::Udp, v6),
+                    _ => sys::socket(if v6 { libc::AF_INET6 } else { libc::AF_INET },
+                                     libc::SOCK_DGRAM | libc::SOCK_NONBLOCK),
+                };
+                self.udp.recv_clients(&self.ep, &r,
+                                      |nflows| fds_left(budget, nconns, nflows, FDS_PER_FLOW),
+                                      new_sock);
             }
         }
     }
@@ -141,7 +151,7 @@ impl Forwarder {
     fn flow_event(&mut self, id: usize) {
         let Some(li) = self.udp.listener(id) else { return };
         let l = &self.listeners[li];
-        self.udp.recv_host(id, l.fd.as_raw_fd(), l.addr.is_ipv6());
+        self.udp.recv_replies(id, l.fd.as_raw_fd(), l.addr.is_ipv6());
     }
 
     /// Accept all pending connections on listener @li
@@ -355,9 +365,6 @@ fn peer(target: &Target, conn: &Conn) -> std::io::Result<Option<Peer>> {
 
 
 fn run(mut cfg: Config) -> Result<u8, String> {
-    if cfg.forwards.iter().any(|f| f.inbound && f.proto == Proto::Udp) {
-        return Err("UDP forwarding from the host (-u) isn't implemented yet".into());
-    }
     cfg.resolve()?;
 
     // One socket per forwarded port: in the namespace, then on the host
