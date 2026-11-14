@@ -213,6 +213,14 @@ check "reader sees EOF when command closes standard output" sh -c "
 		{ cat >/dev/null; echo \$(( (\$(date +%s%N) - start) / 1000000 )) > '${TMP}/eof_ms'; }
 	test \$(cat '${TMP}/eof_ms') -lt 1000"
 
+check "command runs with original IDs, without capabilities" sh -c "'${B}' -- sh -c '
+	test \$(id -u) = $(id -u) && test \$(id -g) = $(id -g) &&
+	grep -q \"^CapEff:[[:space:]]*0*\$\" /proc/self/status && ! ip link set lo down 2>/dev/null'"
+check "--root: command runs as root" sh -c "'${B}' --root -- sh -c '
+	test \$(id -u) = 0 && ip link set lo down'"
+check "started as root: command stays root" unshare -r sh -c "'${B}' -- sh -c '
+	test \$(id -u) = 0 && ip link set lo down'"
+
 check "exit status passed through" sh -c "'${B}' -- sh -c 'exit 7'; test \$? -eq 7"
 
 check "no descriptors leaked to command" sh -c "'${B}' -T 8000:'${TMP}/echo.sock' -U 53 -- \

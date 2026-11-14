@@ -350,7 +350,7 @@ fn run(mut cfg: Config) -> Result<u8, String> {
                            ports.len()));
     }
 
-    let Sandbox { pid, pidfd, listeners } = sandbox::spawn(&cfg.command, &ports, &nofile_orig)
+    let Sandbox { pid, pidfd, listeners } = sandbox::spawn(&cfg.command, &ports, cfg.root, &nofile_orig)
         .map_err(|e| format!("cannot start sandbox: {e}"))?;
 
     // The command has its copies of whatever we inherited: drop ours

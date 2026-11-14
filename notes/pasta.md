@@ -495,7 +495,10 @@ everything up itself before `exec`ing the command (`src/sandbox.rs`):
 3. Create the listening sockets: one per `-T` port, dual-stack, bound to `lo`
    with `SO_BINDTODEVICE`.
 4. Send them to the parent with `SCM_RIGHTS` over a `socketpair`.
-5. Close them and `exec` the command.
+5. Unless `--root` is given, create a nested user namespace mapping the
+   original UID/GID to root of the first one, so that the command runs with
+   its original IDs and without capabilities (see `user-ns.md`, section 5).
+6. Close the sockets and `exec` the command.
 
 Compared to Option A:
 

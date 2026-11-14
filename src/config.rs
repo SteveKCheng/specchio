@@ -46,6 +46,10 @@ Options:
   -u, --udp-ports none
                       Accepted for compatibility with pasta(1): no inbound
                       forwarding is supported yet
+      --root          Run COMMAND as root in the new user namespace, which
+                      can configure the network namespace.  By default,
+                      COMMAND runs with the user and group IDs specchio was
+                      started with, without capabilities
   -d, --debug         Print debugging messages
   -h, --help          Display this help message and exit
       --version       Show version and exit
@@ -220,6 +224,8 @@ impl fmt::Display for Forward {
 #[derive(Debug)]
 pub struct Config {
     pub forwards: Vec<Forward>,
+    /// Keep the command root in the sandbox's user namespace
+    pub root: bool,
     pub debug: bool,
     pub command: Vec<OsString>,
 }
@@ -482,7 +488,8 @@ fn port_opt(arg: &[u8], args: &mut impl Iterator<Item = OsString>)
 /// Return: Ok(None) if the program should exit successfully (--help etc.)
 pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Config>, String> {
     let mut args = args.into_iter();
-    let mut cfg = Config { forwards: Vec::new(), debug: false, command: Vec::new() };
+    let mut cfg = Config { forwards: Vec::new(), root: false, debug: false,
+                           command: Vec::new() };
 
     while let Some(arg) = args.next() {
         let a = arg.as_bytes();
@@ -497,6 +504,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Config>,
                 return Ok(None);
             }
             b"-d" | b"--debug" => cfg.debug = true,
+            b"--root" => cfg.root = true,
             _ if let Some(r) = port_opt(a, &mut args) => match r? {
                 (PortOpt::TcpNs, spec) => add_forwards(&mut cfg, Proto::Tcp, &spec)?,
                 (PortOpt::UdpNs, spec) => add_forwards(&mut cfg, Proto::Udp, &spec)?,
@@ -674,7 +682,7 @@ mod tests {
     fn resolve_localhost() {
         let mut forwards = fwds("8080:localhost/80,8081-8082:localhost/81-82");
         forwards.push(fwd("80:192.0.2.1"));
-        let mut cfg = Config { forwards, debug: false, command: Vec::new() };
+        let mut cfg = Config { forwards, root: false, debug: false, command: Vec::new() };
         cfg.resolve().unwrap();
         let Target::Host { addrs, .. } = &cfg.forwards[0].target else { panic!() };
         assert!(!addrs.is_empty());
@@ -729,6 +737,10 @@ mod tests {
         assert!(args(&["-T", "80,80"]).is_err());
         assert!(args(&["-T", "80-90,85"]).is_err());
         assert!(args(&["-T"]).is_err());
+        assert!(!args(&["true"]).unwrap().unwrap().root);
+        let cfg = args(&["--root", "-T", "80", "id", "--root"]).unwrap().unwrap();
+        assert!(cfg.root);
+        assert_eq!(cfg.command, ["id", "--root"]);
 
         // TCP and UDP rules are separate
         let cfg = args(&["-T", "53", "-U", "53", "-U", "123,500-501", "-T", "none"]);

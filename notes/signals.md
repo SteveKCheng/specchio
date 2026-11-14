@@ -32,8 +32,8 @@ Contents:
   specchio dies at once, and the death signal `SIGKILL`s the command. The
   command never sees the `SIGTERM`, and can't shut down gracefully.
 
-Correction to a comment in `src/sandbox.rs`: it says that `unshare()`
-clears the parent death signal. It doesn't, at least on Linux 7.3: tested
+Correction to a comment in `src/sandbox.rs` (since fixed): it said that
+`unshare()` clears the parent death signal. It doesn't, at least on Linux 7.3: tested
 with `unshare(CLONE_NEWUSER | CLONE_NEWNET)`, writing `uid_map` and
 `gid_map`, and a further nested `unshare(CLONE_NEWUSER)`, `PR_GET_PDEATHSIG`
 still returned `SIGKILL` after each step. What does clear it (see

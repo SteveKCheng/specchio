@@ -16,9 +16,11 @@ and nothing else, and needs no credentials.
 
 ```sh
 specchio -T 3128:/run/user/1000/proxy.sock -- \
-    bwrap --dev-bind / / --unshare-user --uid "$(id -u)" --gid "$(id -g)" -- \
     env https_proxy=http://127.0.0.1:3128 agent ...
 ```
+
+specchio only isolates the network: for the filesystem and the rest, nest
+`bwrap` or similar inside it (`specchio ... -- bwrap ... -- agent ...`).
 
 ### `-T`, `--tcp-ns`
 
@@ -112,13 +114,24 @@ everything except standard streams at startup, so the command never gets
 them.) It exits with the command's exit
 status (128 + signal number if the command was killed).
 
+The command runs with the user and group IDs specchio was started with, and
+without capabilities, so programs (and users) aren't misled into thinking
+they run as root. Supplementary groups show up as the overflow group
+(`nobody`), as they aren't mapped. With `--root`, the command runs as root in
+the new user namespace instead, with all capabilities there: it can configure
+the network namespace, but gains no privileges outside it. If specchio is
+started as root (in whatever user namespace), the command stays root.
+
 ## How it works
 
 1. **Child (`sandbox.rs`)**: `unshare(CLONE_NEWUSER | CLONE_NEWNET)`, maps the
    original UID/GID to root (a fixed one-line map), brings `lo` up, creates a
    listening (TCP) or receiving (UDP) socket for each forwarded port, and sends
    them to the parent with `SCM_RIGHTS` over a `socketpair`, at most 253 per
-   message. It then closes them and `exec`s the command.
+   message. Unless `--root` is given, it then creates a nested user namespace,
+   mapping the original UID/GID to root of the first one, so that the command
+   runs with its original IDs, and loses all capabilities when `exec`ed. It
+   then closes the sockets and `exec`s the command.
    A socket stays in the network namespace it was created in, so the parent
    needs no capabilities and never enters the namespace (unlike `pasta`, which
    uses `setns()`). The command can't get at the listeners afterwards: they're
@@ -166,17 +179,15 @@ dropped.
 
 - **Inbound forwarding** (`-t`/`-u`, host port to sandbox). This needs sockets created in
   the sandbox namespace on demand, and a pool sent at startup can't be refilled
-  once the child has `exec`'d. Options: keep a small helper process in the
-  namespace that makes sockets on request over the same `socketpair`, or have
-  the parent join the sandbox user namespace and `setns()` from a thread
-  (network `setns()` is per-thread).
+  once the child has `exec`'d. The plan: the parent joins the sandbox's user
+  namespace at startup, only if there's inbound forwarding, and creates
+  sockets from a short-lived thread that enters the network namespace. See
+  `notes/user-ns.md`.
 - **Hardening**: seccomp, dropping the filesystem view like `pasta`'s
   `isolate_prefork()`. For path targets, that needs `O_PATH` directory handles
   opened at startup, then `fchdir()` plus `connect()` with a relative name.
 - Abstract socket targets have no access control: any process in the host
   network namespace can listen on that name. Prefer filesystem sockets.
-- The command runs as root in the new user namespace, holding all capabilities
-  there. Nest `bwrap` (as above) to drop that.
 
 ## Testing
 

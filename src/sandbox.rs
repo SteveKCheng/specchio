@@ -14,7 +14,10 @@
 //! 3. create the listening sockets (TCP) and receiving sockets (UDP) for all
 //!    forwarded ports
 //! 4. send them to the parent with SCM_RIGHTS over a socketpair, in batches
-//! 5. close everything and exec() the command
+//! 5. unless asked to keep root, unshare() a nested user namespace mapping the
+//!    original UID and GID to root of the first one, so that the command runs
+//!    with its original IDs, and without capabilities once it's exec()ed
+//! 6. close everything and exec() the command
 //!
 //! The parent never needs any capability, or to enter any namespace.
 
@@ -48,8 +51,10 @@ pub struct Sandbox {
 
 /// Start @command in a new sandbox, with a socket for each of @ports, in order
 ///
+/// @root: run the command as root in the sandbox's user namespace, instead of
+///        with the original user and group IDs
 /// @nofile is the original RLIMIT_NOFILE, restored for the command
-pub fn spawn(command: &[OsString], ports: &[(Proto, u16)], nofile: &libc::rlimit)
+pub fn spawn(command: &[OsString], ports: &[(Proto, u16)], root: bool, nofile: &libc::rlimit)
              -> io::Result<Sandbox> {
     // Prepare everything that allocates before fork()
     let argv: Vec<CString> = command.iter()
@@ -75,7 +80,7 @@ pub fn spawn(command: &[OsString], ports: &[(Proto, u16)], nofile: &libc::rlimit
     let pid = cvt(unsafe { libc::fork() })?;
     if pid == 0 {
         drop(ours);
-        child(theirs, uid, gid, ppid, ports, nofile, &argvp);
+        child(theirs, uid, gid, ppid, ports, root, nofile, &argvp);
     }
     drop(theirs);
 
@@ -157,10 +162,11 @@ pub fn reap(pid: libc::pid_t) -> i32 {
 }
 
 /// Body of the child process: set up the sandbox, report back, exec()
+#[allow(clippy::too_many_arguments)]
 fn child(sock: OwnedFd, uid: libc::uid_t, gid: libc::gid_t, ppid: libc::pid_t,
-         ports: &[(Proto, u16)], nofile: &libc::rlimit,
+         ports: &[(Proto, u16)], root: bool, nofile: &libc::rlimit,
          argv: &[*const libc::c_char]) -> ! {
-    match child_setup(uid, gid, ppid, ports) {
+    match child_setup(uid, gid, ppid, ports, root) {
         Ok(fds) => {
             let raw: Vec<RawFd> = fds.iter().map(|f| f.as_raw_fd()).collect();
             // At least one message, even without sockets
@@ -203,25 +209,14 @@ fn child(sock: OwnedFd, uid: libc::uid_t, gid: libc::gid_t, ppid: libc::pid_t,
 ///
 /// Return: sockets for the parent, or error string
 fn child_setup(uid: libc::uid_t, gid: libc::gid_t, ppid: libc::pid_t,
-               ports: &[(Proto, u16)]) -> Result<Vec<OwnedFd>, String> {
+               ports: &[(Proto, u16)], root: bool) -> Result<Vec<OwnedFd>, String> {
     // SAFETY: unshare() has no memory safety preconditions
     cvt(unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) })
         .map_err(|e| format!("cannot create namespaces: {e}"))?;
+    map_ids(uid, 0, gid, 0)?;
 
-    // Unprivileged processes must disable setgroups() before writing gid_map
-    match write_proc("/proc/self/setgroups", "deny") {
-        Err(e) if e.kind() != io::ErrorKind::NotFound => {
-            return Err(format!("cannot write /proc/self/setgroups: {e}"));
-        }
-        _ => {}
-    }
-    write_proc("/proc/self/uid_map", &format!("0 {uid} 1"))
-        .map_err(|e| format!("cannot write /proc/self/uid_map: {e}"))?;
-    write_proc("/proc/self/gid_map", &format!("0 {gid} 1"))
-        .map_err(|e| format!("cannot write /proc/self/gid_map: {e}"))?;
-
-    // Credentials changed in unshare(), which clears the parent death signal:
-    // set it only now, then check we didn't miss the parent exiting already
+    // Die with the parent, and check we didn't miss it exiting already.
+    // Neither unshare() nor the ID maps clear the parent death signal
     // SAFETY: prctl() with integer arguments, getppid() can't fail
     unsafe {
         libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
@@ -232,11 +227,43 @@ fn child_setup(uid: libc::uid_t, gid: libc::gid_t, ppid: libc::pid_t,
 
     loopback_up().map_err(|e| format!("cannot bring up loopback interface: {e}"))?;
 
-    ports.iter()
+    let fds = ports.iter()
         .map(|&(proto, port)| listen(proto, port).map_err(|e| {
             format!("cannot listen on {} port {port} in namespace: {e}", proto.name())
         }))
-        .collect()
+        .collect::<Result<_, _>>()?;
+
+    // Drop "fake root" for the command: in a nested user namespace, map the
+    // original IDs to root of the sandbox's user namespace, which we are now.
+    // Once exec()ed as a user other than root there, the command has no
+    // capabilities, in either user namespace.  This doesn't affect the
+    // parent death signal.  Nothing to do if we started as root
+    if !root && uid != 0 {
+        // SAFETY: unshare() has no memory safety preconditions
+        cvt(unsafe { libc::unshare(libc::CLONE_NEWUSER) })
+            .map_err(|e| format!("cannot create nested user namespace (try --root): {e}"))?;
+        map_ids(0, uid, 0, gid)?;
+    }
+
+    Ok(fds)
+}
+
+/// Map @outside_uid and @outside_gid to @inside_uid and @inside_gid in the
+/// user namespace we just created: the only mapping we can write unprivileged
+fn map_ids(outside_uid: libc::uid_t, inside_uid: libc::uid_t,
+           outside_gid: libc::gid_t, inside_gid: libc::gid_t) -> Result<(), String> {
+    // Unprivileged processes must disable setgroups() before writing gid_map.
+    // In a nested user namespace, it's already disabled, and stays so
+    match write_proc("/proc/self/setgroups", "deny") {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => {
+            return Err(format!("cannot write /proc/self/setgroups: {e}"));
+        }
+        _ => {}
+    }
+    write_proc("/proc/self/uid_map", &format!("{inside_uid} {outside_uid} 1"))
+        .map_err(|e| format!("cannot write /proc/self/uid_map: {e}"))?;
+    write_proc("/proc/self/gid_map", &format!("{inside_gid} {outside_gid} 1"))
+        .map_err(|e| format!("cannot write /proc/self/gid_map: {e}"))
 }
 
 fn write_proc(path: &str, content: &str) -> io::Result<()> {

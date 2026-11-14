@@ -135,11 +135,13 @@ too, besides being an extra process with its own protocol.
 
 ## 5. Dropping fake root with a nested user namespace
 
-The command runs as root in the sandbox's user namespace, with all
-capabilities there (it can, for example, reconfigure `lo`). `bwrap` with
-`--unshare-user --uid` drops that, but an option in specchio would help where
-`bwrap` isn't used. It can be done entirely by the child, before `exec`, with
-nothing for the parent to do:
+The command used to run as root in the sandbox's user namespace, with all
+capabilities there (it could, for example, reconfigure `lo`). `bwrap` with
+`--unshare-user --uid` drops that, but not everyone uses `bwrap`, and some
+programs (or users) are confused by running as "root", unaware that it's
+"fake". Dropping it can be done entirely by the child, before `exec`, with
+nothing for the parent to do. specchio now does this by default (`--root`
+disables it, and there's nothing to drop if specchio was started as root):
 
 1. After creating the sockets, `unshare(CLONE_NEWUSER)` again.
 2. Write `uid_map` as `UID 0 1` and `gid_map` as `GID 0 1`, with the original
@@ -176,7 +178,9 @@ the network namespace worked.
 
 ## 6. Plan
 
-For inbound forwarding:
+For inbound forwarding, and only if any inbound forwarding is configured
+(otherwise specchio stays in its own user namespace, single-threaded, and
+dumpable, as now):
 
 1. The child sends a descriptor for its network namespace with the listening
    sockets, before nesting a user namespace (if asked to drop root).
